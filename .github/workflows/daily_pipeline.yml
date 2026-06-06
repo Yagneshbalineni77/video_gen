@@ -1,0 +1,80 @@
+name: Daily Faceless Pipeline
+
+on:
+  schedule:
+    # Runs every day at 08:00 UTC
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip YouTube upload (dry run)"
+        required: false
+        default: "false"
+        type: boolean
+      phase:
+        description: "Run only a specific phase (1-5, leave blank for full run)"
+        required: false
+        default: ""
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system deps (FFmpeg)
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Write credentials
+        env:
+          YOUTUBE_TOKEN_JSON: ${{ secrets.YOUTUBE_TOKEN_JSON }}
+          YOUTUBE_CLIENT_SECRETS_JSON: ${{ secrets.YOUTUBE_CLIENT_SECRETS_JSON }}
+        run: |
+          mkdir -p credentials
+          echo "$YOUTUBE_TOKEN_JSON" > credentials/youtube_token.json
+          echo "$YOUTUBE_CLIENT_SECRETS_JSON" > credentials/client_secrets.json
+
+      - name: Run pipeline
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+          LUMAAI_API_KEY: ${{ secrets.LUMAAI_API_KEY }}
+          FAL_KEY: ${{ secrets.FAL_KEY }}
+          NICHE_KEYWORDS: ${{ vars.NICHE_KEYWORDS || 'dark history,untold history,hidden secrets' }}
+          VISUAL_PROVIDER: ${{ vars.VISUAL_PROVIDER || 'luma' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          YOUTUBE_TOKEN_PATH: credentials/youtube_token.json
+          YOUTUBE_CLIENT_SECRETS_PATH: credentials/client_secrets.json
+        run: |
+          if [ -n "${{ github.event.inputs.phase }}" ]; then
+            python main.py --phase ${{ github.event.inputs.phase }}
+          else
+            python main.py
+          fi
+
+      - name: Upload output artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-output-${{ github.run_id }}
+          path: |
+            output/trends.json
+            output/script.json
+            output/renders/final_render.mp4
+            output/thumbnails/thumbnail.jpg
+            output/pipeline_state.json
+          retention-days: 7
