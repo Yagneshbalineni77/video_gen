@@ -40,6 +40,11 @@ class SceneScript(BaseModel):
     image_prompt: str
     video_prompt: str
     engine_type: Literal["veo_cinematic", "code_animator"] = "veo_cinematic"
+    # Exact formula / equation / key term to pin on screen as a guaranteed-accurate
+    # graphic (e.g. "F = ma", "CO₂ + 6H₂O → C₆H₁₂O₆"). Empty when the scene has no
+    # critical text. Burned as a crisp overlay in Phase 4 — never AI-rendered, so it
+    # is always correct (fixes Imagen/Veo garbling formulas like F=ma → f=a).
+    overlay_text: Optional[str] = None
     duration_ms: Optional[int] = None  # filled in Phase 3 after TTS
 
 

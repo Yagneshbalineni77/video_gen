@@ -28,6 +28,7 @@ from utils.ffmpeg_helpers import (
     merge_video_audio,
     mix_bgm,
     normalize_clip,
+    overlay_image_on_video,
     probe_duration,
     trim_video_to_duration,
 )
@@ -140,7 +141,66 @@ class VideoEditor:
             else:
                 raise FileNotFoundError(f"No visual asset for scene {sid}")
 
+            # Pin a guaranteed-accurate formula/term graphic over this scene if the
+            # script declared one (model-independent → never garbled like F=ma->f=a).
+            if getattr(scene, "overlay_text", None):
+                ov_png = self._render_overlay(scene.overlay_text)
+                ov_clip = self._tmp / f"scene_{sid}_overlay.mp4"
+                overlay_image_on_video(trimmed, ov_png, ov_clip)
+                trimmed = ov_clip
+                log.info("  [edit] scene %d overlay: %s", sid, scene.overlay_text)
+
             log.info("  [edit] scene %d prepared (%.2fs)", sid, target_ms / 1000)
             clips.append(trimmed)
 
         return clips
+
+    @staticmethod
+    def _overlay_font(size: int):
+        from PIL import ImageFont
+        for path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        ):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def _render_overlay(self, text: str) -> Path:
+        """Render the exact formula/term as a crisp top-center graphic (RGBA PNG).
+        Full Unicode (subscripts ₂, arrows →) via a symbol-capable font — always
+        pixel-perfect because it's drawn from the script text, not AI-generated."""
+        from PIL import Image, ImageDraw
+
+        W, H = 1920, 1080
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # shrink font until the text fits comfortably across the frame
+        size = 72
+        font = self._overlay_font(size)
+        while draw.textlength(text, font=font) > W - 520 and size > 30:
+            size -= 4
+            font = self._overlay_font(size)
+
+        bb = draw.textbbox((0, 0), text, font=font)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        pad_x, pad_y = 56, 34
+        panel_w, panel_h = tw + 2 * pad_x, th + 2 * pad_y
+        x0 = (W - panel_w) // 2
+        y0 = 70  # top band, clear of bottom subtitles
+
+        # rounded translucent panel + accent border
+        draw.rounded_rectangle([x0, y0, x0 + panel_w, y0 + panel_h], radius=22,
+                               fill=(8, 12, 28, 205), outline=(79, 195, 247, 235), width=3)
+        tx = x0 + pad_x - bb[0]
+        ty = y0 + pad_y - bb[1]
+        draw.text((tx + 2, ty + 2), text, font=font, fill=(0, 0, 0, 180))   # shadow
+        draw.text((tx, ty), text, font=font, fill=(255, 255, 255, 255))     # text
+
+        dest = self._tmp / "_overlay.png"
+        img.save(str(dest))
+        return dest

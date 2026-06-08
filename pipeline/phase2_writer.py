@@ -155,6 +155,16 @@ Your scenes must form a CONTINUOUS VISUAL JOURNEY — not a slideshow of unrelat
   - Randomly switching between close-up and aerial every scene
   - Each scene having a completely unrelated setting
 
+═══ ON-SCREEN FORMULA / TERM ACCURACY (CRITICAL) ═══
+AI image/video models garble exact text (they render "F=ma" as "F=a", "CO₂" as "C2").
+So for ANY scene that presents a precise formula, equation, chemical notation, key
+definition, date, or label that MUST be exactly correct, set `overlay_text` to that
+EXACT text — it will be rendered as a guaranteed-accurate on-screen graphic instead
+of trusting the AI to draw it. Use proper Unicode (subscripts ₂, arrows →, ×, ²).
+  Examples: "F = ma", "CO₂ + 6H₂O → C₆H₁₂O₆ + 6O₂", "E = mc²", "speed = distance / time"
+Keep it SHORT (a single formula/term/label, ≤40 chars ideally). Set `overlay_text`
+to an EMPTY STRING "" for scenes with no critical formula/term (most narrative scenes).
+
 ═══ ENGINE SELECTION RULES (CRITICAL) ═══
 For each scene, you MUST choose the most appropriate `engine_type` based on the narrative context:
 1. "veo_cinematic" (DEFAULT): Use this for dramatic, historical, atmospheric, or photorealistic scenes.
@@ -220,8 +230,9 @@ _RESPONSE_SCHEMA = {
                     "image_prompt": {"type": "string"},
                     "video_prompt": {"type": "string"},
                     "engine_type": {"type": "string", "enum": ["veo_cinematic", "code_animator"]},
+                    "overlay_text": {"type": "string"},
                 },
-                "required": ["scene_id", "narration", "image_prompt", "video_prompt", "engine_type"],
+                "required": ["scene_id", "narration", "image_prompt", "video_prompt", "engine_type", "overlay_text"],
             },
         },
     },
@@ -292,6 +303,10 @@ class ScriptWriter:
 
     def _parse(self, raw: dict, trend: TrendCandidate) -> VideoScript:
         metadata = VideoMetadata(**raw["metadata"])
+        for s in raw["scenes"]:
+            # Normalise the model's empty-string "no formula" into a real None.
+            if not (s.get("overlay_text") or "").strip():
+                s["overlay_text"] = None
         scenes = [SceneScript(**s) for s in raw["scenes"]]
         visual_style_brief = raw.get("visual_style_brief", "")
 

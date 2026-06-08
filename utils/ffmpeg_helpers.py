@@ -114,6 +114,22 @@ def image_to_video(image_path: Path, duration_ms: int, dest: Path) -> None:
 
 # ── composite ────────────────────────────────────────────────────────────────
 
+def overlay_image_on_video(video: Path, image: Path, dest: Path) -> None:
+    """Composite a full-frame RGBA PNG (e.g. a guaranteed-accurate formula graphic)
+    over a video clip. The PNG carries its own transparency + positioning."""
+    run_ffmpeg(
+        [
+            "-i", str(video),
+            "-i", str(image),
+            "-filter_complex", "[0:v][1:v]overlay=0:0",
+            "-c:v", "libx264", "-crf", "18", "-preset", PRESET,
+            "-pix_fmt", "yuv420p", "-an",
+            str(dest),
+        ],
+        desc=f"overlay {image.name}",
+    )
+
+
 def composite_chromakey(bg: Path, fg: Path, dest: Path) -> None:
     """Composite a green-screen foreground video over a background video."""
     run_ffmpeg(
