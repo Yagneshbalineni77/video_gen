@@ -7,11 +7,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# x264 speed/quality tradeoff. "veryfast" roughly halves CPU time vs "fast" with a
+# negligible quality difference — important when many videos assemble in parallel
+# (Phase 4 is CPU-bound). Override with FFMPEG_PRESET if you want max quality.
+PRESET = os.getenv("FFMPEG_PRESET", "veryfast")
 
 # ── core runner ───────────────────────────────────────────────────────────────
 
@@ -43,7 +49,7 @@ def normalize_clip(src: Path, dest: Path, width: int = 1920, height: int = 1080,
             "-i", str(src),
             "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}",
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:v", "libx264", "-crf", "18", "-preset", PRESET,
             "-pix_fmt", "yuv420p",
             "-an",          # no audio – we keep narration separate
             str(dest),
@@ -74,7 +80,7 @@ def trim_video_to_duration(src: Path, duration_ms: int, dest: Path) -> None:
                 "-i", str(src),
                 "-t", f"{secs:.3f}",
                 "-vf", "fps=25",
-                "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                "-c:v", "libx264", "-crf", "18", "-preset", PRESET,
                 "-pix_fmt", "yuv420p",
                 "-an",
                 str(dest),
@@ -97,7 +103,7 @@ def image_to_video(image_path: Path, duration_ms: int, dest: Path) -> None:
             "-i", str(image_path),
             "-vf", vf,
             "-t", f"{secs:.3f}",
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:v", "libx264", "-crf", "18", "-preset", PRESET,
             "-pix_fmt", "yuv420p",
             "-an",
             str(dest),
@@ -116,7 +122,7 @@ def composite_chromakey(bg: Path, fg: Path, dest: Path) -> None:
             "-i", str(fg),
             "-filter_complex", "[1:v]colorkey=0x00FF00:0.2:0.1[ckout];[0:v][ckout]overlay=shortest=1[outv]",
             "-map", "[outv]",
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:v", "libx264", "-crf", "18", "-preset", PRESET,
             "-pix_fmt", "yuv420p",
             "-an",
             str(dest),
@@ -168,7 +174,7 @@ def concat_video_xfade(clips: list[Path], dest: Path, fade_dur: float = 0.7) -> 
         inputs + [
             "-filter_complex", ";".join(filters),
             "-map", "[vfinal]",
-            "-c:v", "libx264", "-crf", "17", "-preset", "fast",
+            "-c:v", "libx264", "-crf", "17", "-preset", PRESET,
             "-pix_fmt", "yuv420p",
             str(dest),
         ],
@@ -191,6 +197,29 @@ def concat_audio(audio_paths: list[Path], dest: Path) -> None:
         desc="concat narration",
     )
     list_file.unlink(missing_ok=True)
+
+
+def master_narration(src: Path, dest: Path) -> None:
+    """Broadcast-grade narration polish using only ffmpeg:
+      highpass     – remove sub-80Hz rumble/plosive thump
+      acompressor  – even out level so quiet/loud syllables sit together
+      loudnorm     – normalize to -16 LUFS (the standard for online video voice)
+      alimiter     – catch stray peaks so nothing clips
+    Makes narration clear, consistent scene-to-scene, and properly loud.
+    """
+    run_ffmpeg(
+        [
+            "-i", str(src),
+            "-af",
+            "highpass=f=80,"
+            "acompressor=threshold=-18dB:ratio=3:attack=8:release=180:makeup=2,"
+            "loudnorm=I=-16:TP=-1.5:LRA=11,"
+            "alimiter=limit=0.95",
+            "-ar", "24000", "-ac", "1",
+            str(dest),
+        ],
+        desc="master narration",
+    )
 
 
 def merge_video_audio(video_path: Path, audio_path: Path, dest: Path) -> None:
@@ -257,7 +286,7 @@ def burn_subtitles(video_path: Path, subtitle_path: Path, dest: Path) -> None:
         [
             "-i", str(video_path.resolve()),
             "-vf", vf,
-            "-c:v", "libx264", "-crf", "17", "-preset", "fast",
+            "-c:v", "libx264", "-crf", "17", "-preset", PRESET,
             "-c:a", "copy",
             str(dest.resolve()),
         ],

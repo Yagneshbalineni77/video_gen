@@ -1,0 +1,24 @@
+# keep the image small and never leak secrets / local state into it
+.git
+.gitignore
+.github
+
+# secrets — supplied at runtime via env vars, NOT baked into the image
+.env
+.env.*
+credentials/
+
+# generated output + persisted job state (mounted as a volume instead)
+output/
+
+# caches / local virtualenvs / editor cruft
+.cache/
+**/__pycache__/
+**/*.pyc
+.venv/
+venv/
+*.log
+.vscode/
+.claude/
+
+# the Whisper model is re-cached inside the image during build

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now (datetime.utcnow() is deprecated in Python 3.12+)."""
+    return datetime.now(timezone.utc)
 
 
 # ─── Phase 1 ──────────────────────────────────────────────────────────────────
@@ -22,7 +27,7 @@ class TrendCandidate(BaseModel):
 
 
 class TrendReport(BaseModel):
-    scraped_at: datetime = Field(default_factory=datetime.utcnow)
+    scraped_at: datetime = Field(default_factory=_utcnow)
     candidates: list[TrendCandidate]
     top_concepts: list[TrendCandidate]
 
@@ -34,6 +39,7 @@ class SceneScript(BaseModel):
     narration: str
     image_prompt: str
     video_prompt: str
+    engine_type: Literal["veo_cinematic", "code_animator"] = "veo_cinematic"
     duration_ms: Optional[int] = None  # filled in Phase 3 after TTS
 
 
@@ -110,14 +116,14 @@ class PublishResult(BaseModel):
     youtube_video_id: str
     youtube_url: str
     title: str
-    published_at: datetime = Field(default_factory=datetime.utcnow)
+    published_at: datetime = Field(default_factory=_utcnow)
 
 
 # ─── Pipeline state ───────────────────────────────────────────────────────────
 
 class PipelineRun(BaseModel):
     run_id: str
-    started_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: datetime = Field(default_factory=_utcnow)
     trend: Optional[TrendCandidate] = None
     script: Optional[VideoScript] = None
     assets: Optional[AssetBundle] = None

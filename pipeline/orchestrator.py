@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.console import Console
@@ -34,7 +34,7 @@ class Pipeline:
     # ── public ──────────────────────────────────────────────────────────────
 
     def run(self) -> list[PipelineRun]:
-        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         console.rule(f"[bold cyan]Faceless Pipeline – run {run_id}")
 
         # Phase 1 – Trends

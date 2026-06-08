@@ -35,6 +35,7 @@ def _build_system_prompt() -> str:
         settings.VISUAL_STYLE,
         settings.VISUAL_STYLE_PRESETS["dark_cinematic"],
     )
+    script_lang = settings.narration_profile()["script_lang"]
 
     return f"""You are an expert faceless YouTube content creator AND a veteran cinematographer.
 You specialize in high-retention educational/historical/mysterious content with
@@ -47,9 +48,14 @@ NARRATIVE RULES:
   - Present-tense narration
   - Zero filler words
   - narration per scene: strict MAXIMUM of 15 words (< 8 seconds at natural pace) to prevent video looping
-  - VERY IMPORTANT: The `narration` text MUST be written in English.
+  - VERY IMPORTANT: The `narration` text MUST be written in: {script_lang}.
+    (Only the narration uses this language — keep image_prompt, video_prompt, tags,
+     and all other fields in English so the image/video models understand them.)
 
 TONE: Strictly academic, highly literal, scientific, textbook-style informative.
+      This content is for a real educational company. Every claim must be factually accurate.
+      Every visual must be a PRECISE literal illustration of what is being said — zero abstract metaphors.
+      Students are the audience — clarity and accuracy are more important than drama.
 
 ═══ VISUAL STYLE DNA (apply to ALL scenes) ═══
   Color Palette: {style['color_palette']}
@@ -127,6 +133,27 @@ ALSO output a `scene_compositions` array with one entry per scene:
 RULE: When writing image_prompt and video_prompt for a scene, you MUST reference
 the character by their exact `name` from the cast. Do NOT invent new descriptions
 that contradict the cast's physical_description.
+
+═══ TEMPORAL VISUAL FLOW (CRITICAL FOR EDUCATIONAL QUALITY) ═══
+Your scenes must form a CONTINUOUS VISUAL JOURNEY — not a slideshow of unrelated images.
+
+  RULE: Each scene's video_prompt must visually FLOW from the previous scene.
+  Think of the camera as a single documentary camera that never cuts — it just changes angle.
+
+  HOW TO ACHIEVE FLOW:
+  - If scene N shows a macro close-up of a molecule → scene N+1 should pull back to
+    reveal the full molecular structure, OR zoom into a DIFFERENT region of the same subject.
+  - If scene N shows an overhead diagram → scene N+1 can orbit around the same subject.
+  - If scene N ends on a specific object → scene N+1 should start near that same object.
+  - Use bridging language in the video_prompt: "Starting from the [same molecule/diagram/surface]
+    shown in the previous scene…", "Pulling back to reveal…", "Rotating 90° to expose…"
+  - The SUBJECT of the visual should remain conceptually connected for 3-5 consecutive scenes
+    before transitioning to a new subject area.
+
+  WHAT TO AVOID:
+  - Scene 4: underwater lab → Scene 5: aerial cityscape (zero visual connection)
+  - Randomly switching between close-up and aerial every scene
+  - Each scene having a completely unrelated setting
 
 ═══ ENGINE SELECTION RULES (CRITICAL) ═══
 For each scene, you MUST choose the most appropriate `engine_type` based on the narrative context:

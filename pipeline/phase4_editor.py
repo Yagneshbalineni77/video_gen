@@ -24,6 +24,7 @@ from utils.ffmpeg_helpers import (
     concat_audio,
     concat_video_xfade,
     image_to_video,
+    master_narration,
     merge_video_audio,
     mix_bgm,
     normalize_clip,
@@ -42,20 +43,34 @@ class VideoEditor:
         self._render_dir.mkdir(parents=True, exist_ok=True)
         self._tmp.mkdir(parents=True, exist_ok=True)
 
+    FADE_DUR = 0.7  # xfade dissolve overlap between scenes (seconds)
+
     def run(self, bundle: AssetBundle) -> RenderResult:
         log.info("Phase 4 – assembling %d scenes", len(bundle.script.scenes))
 
-        # Step 1 & 2: prepare one silent normalised clip per scene
-        silent_clips = self._prepare_scene_clips(bundle)
+        # Step 1 & 2: prepare one silent normalised clip per scene.
+        # Each non-final clip is padded by FADE_DUR so the xfade overlap is absorbed
+        # by the padding instead of shortening the narration-aligned timeline. This
+        # keeps audio/video in sync across all scenes (otherwise N transitions drop
+        # N×FADE_DUR seconds of video and -shortest truncates the narration tail).
+        silent_clips = self._prepare_scene_clips(bundle, fade_dur=self.FADE_DUR)
 
         # Step 3: xfade concatenate all clips (no hard cuts)
         concat_silent = self._tmp / "concat_silent.mp4"
-        concat_video_xfade(silent_clips, concat_silent, fade_dur=0.7)
+        concat_video_xfade(silent_clips, concat_silent, fade_dur=self.FADE_DUR)
         log.info("  [edit] xfade concat done")
 
-        # Step 4: single continuous narration track
+        # Step 4: single continuous narration track, then master it to broadcast
+        # loudness/clarity (also evens out level differences between scenes).
+        narration_raw = self._tmp / "narration_raw.wav"
+        concat_audio([a.path for a in bundle.audio_assets], narration_raw)
         narration_wav = self._tmp / "narration_full.wav"
-        concat_audio([a.path for a in bundle.audio_assets], narration_wav)
+        try:
+            master_narration(narration_raw, narration_wav)
+            log.info("  [edit] narration mastered (-16 LUFS, compressed)")
+        except Exception as exc:
+            log.warning("  [edit] mastering failed (%s) — using raw narration", exc)
+            narration_wav = narration_raw
 
         # Step 5: mux video + narration
         with_narration = self._tmp / "with_narration.mp4"
@@ -71,9 +86,18 @@ class VideoEditor:
         else:
             pre_sub = with_narration
 
-        # Step 7: Whisper subtitles
+        # Step 7: subtitles. English → Whisper word-level (karaoke). Hindi/Hinglish →
+        # build from the KNOWN script text (ASR is wrong-script/unreliable there).
         sub_path = self._tmp / "subtitles.ass"
-        transcribe_to_ass(narration_wav, sub_path)
+        profile = settings.narration_profile()
+        if profile.get("use_asr", True):
+            transcribe_to_ass(narration_wav, sub_path, language=profile["whisper_lang"])
+        else:
+            from utils.whisper_captions import subtitles_from_scenes
+            dur_map = {a.scene_id: a.duration_ms for a in bundle.audio_assets}
+            items = [(s.narration, dur_map.get(s.scene_id, s.duration_ms or 4000))
+                     for s in bundle.script.scenes]
+            subtitles_from_scenes(items, sub_path, font=profile.get("sub_font", "Arial"))
 
         # Step 8: burn subtitles → final render
         final = self._render_dir / "final_render.mp4"
@@ -86,15 +110,23 @@ class VideoEditor:
 
     # ── private ──────────────────────────────────────────────────────────────
 
-    def _prepare_scene_clips(self, bundle: AssetBundle) -> list[Path]:
+    def _prepare_scene_clips(self, bundle: AssetBundle, fade_dur: float = 0.7) -> list[Path]:
         audio_map = {a.scene_id: a for a in bundle.audio_assets}
         visual_map = {v.scene_id: v for v in bundle.visual_assets}
         clips: list[Path] = []
 
-        for scene in bundle.script.scenes:
+        scenes = bundle.script.scenes
+        fade_ms = int(fade_dur * 1000)
+
+        for i, scene in enumerate(scenes):
             sid = scene.scene_id
             audio = audio_map[sid]
             visual = visual_map[sid]
+
+            # Pad every clip except the last by the fade overlap so the xfade does
+            # not consume narration-aligned time (keeps A/V in sync — see run()).
+            is_last = (i == len(scenes) - 1)
+            target_ms = audio.duration_ms + (0 if is_last else fade_ms)
 
             # Raw source → silent normalised MP4
             raw_norm = self._tmp / f"scene_{sid}_norm.mp4"
@@ -102,13 +134,13 @@ class VideoEditor:
 
             if visual.raw_video_path and visual.raw_video_path.exists():
                 normalize_clip(visual.raw_video_path, raw_norm)
-                trim_video_to_duration(raw_norm, audio.duration_ms, trimmed)
+                trim_video_to_duration(raw_norm, target_ms, trimmed)
             elif visual.keyframe_image_path and visual.keyframe_image_path.exists():
-                image_to_video(visual.keyframe_image_path, audio.duration_ms, trimmed)
+                image_to_video(visual.keyframe_image_path, target_ms, trimmed)
             else:
                 raise FileNotFoundError(f"No visual asset for scene {sid}")
 
-            log.info("  [edit] scene %d prepared (%.2fs)", sid, audio.duration_ms / 1000)
+            log.info("  [edit] scene %d prepared (%.2fs)", sid, target_ms / 1000)
             clips.append(trimmed)
 
         return clips

@@ -206,28 +206,61 @@ class AnimatorFactory:
             
         return html.strip()
 
-    def _record_html_to_mp4(self, html_path: Path, duration_ms: int, dest_mp4: Path) -> None:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                record_video_dir=str(self._video_dir),
-                record_video_size={"width": 1920, "height": 1080}
+    def _record_html_to_mp4(self, html_path: Path, duration_ms: int, dest_mp4: Path, fps: int = 25) -> None:
+        """Capture the GSAP animation as deterministic frames, then assemble with
+        system ffmpeg.
+
+        We deliberately do NOT use Playwright's record_video: it depends on a
+        bundled ffmpeg binary that won't install on every OS. Instead we pause the
+        GSAP global timeline and seek it frame-by-frame, screenshotting each frame —
+        this is reproducible (no real-time/frame-drop variance) and only needs the
+        system Chromium + the system ffmpeg the rest of the pipeline already uses.
+        """
+        import os
+        import tempfile
+
+        from utils.ffmpeg_helpers import run_ffmpeg
+
+        chromium_exe = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or None
+        n_frames = max(1, int(round(duration_ms / 1000 * fps)))
+        frames_dir = Path(tempfile.mkdtemp(prefix="anim_", dir=str(self._video_dir)))
+
+        try:
+            html_str = html_path.read_text(encoding="utf-8")
+            with sync_playwright() as p:
+                # --no-sandbox is required when running as root (e.g. in Docker);
+                # --disable-dev-shm-usage avoids crashes on Docker's small /dev/shm.
+                # Safe here: we only render our own generated HTML, never untrusted pages.
+                browser = p.chromium.launch(
+                    headless=True,
+                    executable_path=chromium_exe,
+                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                )
+                page = browser.new_page(viewport={"width": 1920, "height": 1080})
+                # set_content avoids file:// navigation, which sandboxed (snap) Chromium
+                # blocks with ERR_ACCESS_DENIED. External CDN scripts still load.
+                page.set_content(html_str, wait_until="networkidle")
+
+                # Pause GSAP so we can seek deterministically; harmless if GSAP absent.
+                page.evaluate(
+                    "() => { if (window.gsap) { gsap.globalTimeline.pause(); } }"
+                )
+                for i in range(n_frames):
+                    t = i / fps
+                    page.evaluate(
+                        "(t) => { if (window.gsap) gsap.globalTimeline.time(t); }", t
+                    )
+                    page.screenshot(path=str(frames_dir / f"f{i:05d}.png"))
+                browser.close()
+
+            run_ffmpeg(
+                ["-framerate", str(fps), "-i", str(frames_dir / "f%05d.png"),
+                 "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                 "-pix_fmt", "yuv420p", str(dest_mp4)],
+                desc=f"assemble animation {dest_mp4.name}",
             )
-            page = context.new_page()
-            page.set_viewport_size({"width": 1920, "height": 1080})
-            
-            # Use file URL
-            file_url = f"file:///{html_path.resolve().as_posix()}"
-            page.goto(file_url)
-            
-            # Wait for animation to finish playing
-            page.wait_for_timeout(duration_ms)
-            
-            video_path = page.video.path()
-            context.close()
-            browser.close()
-            
-            shutil.move(video_path, dest_mp4)
+        finally:
+            shutil.rmtree(frames_dir, ignore_errors=True)
 
     def _pick_bgm(self) -> Path | None:
         bgm_dir = settings.BGM_DIR

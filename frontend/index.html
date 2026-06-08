@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Faceless Video Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🎬%3C/text%3E%3C/svg%3E" />
+<style>
+  :root {
+    --bg:#07070c; --card:rgba(22,22,34,.66); --border:rgba(120,120,180,.14);
+    --text:#ece9f5; --muted:#8b8aa6; --faint:#56546e;
+    --accent:#7c5cff; --accent3:#5cc8ff;
+    --grad:linear-gradient(120deg,#7c5cff 0%,#d65cff 50%,#ff7eb6 100%);
+    --ok:#4ade80; --err:#fb7185; --amber:#f5a623;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:'Inter',system-ui,sans-serif;
+    background:radial-gradient(1200px 700px at 80% -10%,#1a1140 0%,transparent 55%),
+               radial-gradient(1000px 600px at 0% 100%,#131a3a 0%,transparent 50%),var(--bg);
+    color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1100px;margin:0 auto;padding:36px 24px 90px}
+  .brand{display:flex;align-items:center;gap:12px}
+  .logo{width:38px;height:38px;border-radius:11px;background:var(--grad);display:grid;place-items:center;font-size:20px;box-shadow:0 8px 30px rgba(124,92,255,.45)}
+  .brand h1{font-size:19px;font-weight:800;letter-spacing:-.02em}
+  .brand .tag{color:var(--faint);font-size:12px;font-weight:500}
+
+  /* tabs */
+  .tabs{display:inline-flex;gap:4px;margin:28px 0 22px;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:12px;padding:4px}
+  .tab{padding:9px 20px;border-radius:9px;font-size:14px;font-weight:700;color:var(--muted);cursor:pointer;border:none;background:none;transition:.15s}
+  .tab.on{background:var(--grad);color:#fff;box-shadow:0 6px 20px rgba(124,92,255,.35)}
+
+  .hero h2{font-size:38px;font-weight:900;letter-spacing:-.035em;line-height:1.06;background:linear-gradient(180deg,#fff 30%,#b9b6d8 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .hero h2 .g{background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .hero p{color:var(--muted);font-size:15px;margin-top:10px;max-width:580px;line-height:1.6}
+  .hero{margin-bottom:22px}
+
+  .card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:24px;backdrop-filter:blur(14px);box-shadow:0 24px 60px rgba(0,0,0,.42)}
+  .label{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);font-weight:700;margin-bottom:12px}
+  textarea{width:100%;resize:vertical;background:rgba(10,10,18,.7);border:1px solid var(--border);border-radius:14px;color:var(--text);font-family:inherit;font-size:15px;line-height:1.55;padding:15px 17px;outline:none;transition:.2s}
+  textarea::placeholder{color:var(--faint)}
+  textarea:focus{border-color:rgba(124,92,255,.6);box-shadow:0 0 0 4px rgba(124,92,255,.12)}
+
+  .styles{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:6px}
+  .style{position:relative;cursor:pointer;border:1px solid var(--border);background:rgba(12,12,22,.55);border-radius:13px;padding:14px;transition:.15s}
+  .style:hover{transform:translateY(-2px);border-color:rgba(124,92,255,.45)}
+  .style.sel{border-color:transparent;background:rgba(124,92,255,.13);box-shadow:0 0 0 1.5px var(--accent) inset}
+  .style .emoji{font-size:22px}.style .name{font-weight:700;font-size:14px;margin-top:7px}
+  .style .desc{color:var(--muted);font-size:11.5px;margin-top:2px;line-height:1.35}
+  .style .check{position:absolute;top:11px;right:11px;width:17px;height:17px;border-radius:50%;background:var(--grad);display:none;place-items:center;font-size:10px;color:#fff}
+  .style.sel .check{display:grid}
+
+  .gen{margin-top:20px;width:100%;border:none;border-radius:14px;cursor:pointer;background:var(--grad);color:#fff;font-family:inherit;font-weight:800;font-size:15.5px;padding:15px;box-shadow:0 12px 36px rgba(124,92,255,.4);transition:.12s}
+  .gen:hover:not(:disabled){transform:translateY(-1px);filter:brightness(1.08)}
+  .gen:disabled{opacity:.5;cursor:not-allowed}
+
+  /* progress (single) */
+  .prog-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:13px}
+  .prog-phase{font-weight:700;font-size:15px}.prog-pct{font-variant-numeric:tabular-nums;color:var(--accent3);font-weight:800;font-size:20px}
+  .bar{height:9px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden}
+  .bar>div{height:100%;background:var(--grad);border-radius:999px;transition:width .6s cubic-bezier(.4,0,.2,1);box-shadow:0 0 16px rgba(214,92,255,.6)}
+  .term{margin-top:16px;background:#05050b;border:1px solid var(--border);border-radius:12px;padding:13px 15px;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:#8f8fb5;max-height:170px;overflow-y:auto;white-space:pre-wrap;line-height:1.6}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px;margin-right:8px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  video{width:100%;border-radius:13px;background:#000;display:block;border:1px solid var(--border)}
+  .row{display:flex;gap:12px;margin-top:16px}
+  .btn-2{flex:1;text-align:center;text-decoration:none;border-radius:12px;padding:13px;font-weight:700;font-size:14px;cursor:pointer;border:1px solid var(--border);transition:.15s}
+  .btn-dl{background:var(--grad);color:#fff;border:none}.btn-dl:hover{filter:brightness(1.08)}
+  .btn-again{background:rgba(255,255,255,.04);color:var(--text)}.btn-again:hover{background:rgba(255,255,255,.09)}
+  .errbox{color:var(--err);background:rgba(251,113,133,.08);border:1px solid rgba(251,113,133,.25);border-radius:12px;padding:13px 15px;font-size:13.5px}
+  .meta{color:var(--faint);font-size:12.5px;margin-top:14px}
+
+  /* capacity strip */
+  .cap{display:flex;gap:18px;align-items:center;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:13px;padding:12px 18px;margin-bottom:16px;font-size:13px}
+  .cap .pill{font-weight:700}.cap .run{color:var(--accent3)}.cap .q{color:var(--amber)}.cap .dn{color:var(--ok)}
+  .cap .sep{color:var(--faint)}
+
+  /* job grid */
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+  .jcard{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:10px}
+  .jcard .jp{font-weight:700;font-size:14px;line-height:1.4;max-height:40px;overflow:hidden}
+  .jbadge{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.04em;padding:3px 9px;border-radius:999px;background:rgba(124,92,255,.16);color:#c9bcff;align-self:flex-start}
+  .jstat{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--muted)}
+  .jstat .pct{font-variant-numeric:tabular-nums;font-weight:800;color:var(--accent3)}
+  .jdone{color:var(--ok);font-weight:700}.jerr{color:var(--err);font-weight:700}
+  .mini-dl{display:inline-block;text-decoration:none;text-align:center;border-radius:10px;padding:9px;font-weight:700;font-size:13px;background:var(--grad);color:#fff}
+  /* batch composer */
+  .composer{padding:18px 20px;margin-bottom:14px}
+  .composer-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .composer-num{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:800}
+  .composer-del{background:rgba(251,113,133,.12);color:var(--err);border:1px solid rgba(251,113,133,.3);border-radius:8px;width:28px;height:28px;cursor:pointer;font-size:13px;line-height:1}
+  .composer-del:hover{background:rgba(251,113,133,.25)}
+  .composer-controls{display:flex;gap:12px;margin-top:12px}
+  .ctrl{flex:1}
+  .ctrl-label{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);font-weight:700;margin-bottom:6px}
+  .ctrl select{width:100%;background:#10101a;border:1px solid var(--border);color:var(--text);border-radius:10px;
+    padding:11px 12px;font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;outline:none;appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='none' stroke='%238b8aa6' stroke-width='2'%3E%3Cpath d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 12px center}
+  .ctrl select:focus{border-color:rgba(124,92,255,.6);box-shadow:0 0 0 3px rgba(124,92,255,.12)}
+  .ctrl option{background:#10101a;color:var(--text)}
+  .composer-actions{margin:4px 0 6px}
+  .add-row{width:100%;background:rgba(124,92,255,.08);border:1px dashed rgba(124,92,255,.4);color:#b9b6d8;
+    border-radius:12px;padding:12px;font-family:inherit;font-weight:700;font-size:14px;cursor:pointer;transition:.15s}
+  .add-row:hover:not(:disabled){background:rgba(124,92,255,.16)}
+  .add-row:disabled{opacity:.4;cursor:not-allowed}
+  @media(max-width:760px){.styles{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.hero h2{font-size:30px}.composer-controls{flex-direction:column}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="/static/vendor/react.js"></script>
+<script src="/static/vendor/react-dom.js"></script>
+<script src="/static/vendor/htm.js"></script>
+<script>
+// Libraries served locally (no external CDN) — loads instantly, works offline/over tunnels.
+const { useState, useEffect, useRef, useCallback } = React;
+const createRoot = ReactDOM.createRoot;
+const html = htm.bind(React.createElement);
+
+const api = {
+  styles: () => fetch('/api/styles').then(r => r.json()),
+  langs:  () => fetch('/api/languages').then(r => r.json()),
+  stats:  () => fetch('/api/stats').then(r => r.json()),
+  jobs:   () => fetch('/api/jobs').then(r => r.json()),
+  gen:    (prompt, style, lang) => fetch('/api/generate', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({prompt, style, lang}) }).then(async r => { if(!r.ok) throw new Error((await r.json()).detail||'failed'); return r.json(); }),
+  job:    (id) => fetch('/api/jobs/'+id).then(r => r.json()),
+};
+
+function LangPicker({ langs, value, onChange }) {
+  return html`<div style=${{display:'flex',gap:'8px',flexWrap:'wrap',marginTop:'6px'}}>
+    ${langs.map(l => html`
+      <button key=${l.key} onClick=${()=>onChange(l.key)}
+        class=${'tab'+(value===l.key?' on':'')} style=${{padding:'9px 14px',fontSize:'13px',border:'1px solid var(--border)'}}>
+        ${l.emoji} ${l.label}
+      </button>`)}
+  </div>`;
+}
+
+function StylePicker({ styles, value, onChange }) {
+  return html`<div class="styles">
+    ${styles.map(s => html`
+      <div key=${s.key} class=${'style'+(value===s.key?' sel':'')} onClick=${()=>onChange(s.key)}>
+        <div class="check">✓</div><div class="emoji">${s.emoji}</div>
+        <div class="name">${s.label}</div><div class="desc">${s.desc}</div>
+      </div>`)}
+  </div>`;
+}
+
+/* ───────────────── single mode ───────────────── */
+function Single({ styles, langs }) {
+  const [prompt,setPrompt]=useState(''); const [style,setStyle]=useState('educational');
+  const [lang,setLang]=useState('indian_english');
+  const [view,setView]=useState('form'); const [job,setJob]=useState(null);
+  const [prog,setProg]=useState({phase:'',percent:0,scenes_done:0,scenes_total:0,tail:''});
+  const [err,setErr]=useState(''); const poll=useRef(null);
+  useEffect(()=>()=>clearInterval(poll.current),[]);
+
+  const start=useCallback(async()=>{
+    if(!prompt.trim())return; setView('progress'); setErr('');
+    setProg({phase:'starting',percent:2,scenes_done:0,scenes_total:0,tail:''});
+    try{
+      const {job_id}=await api.gen(prompt,style,lang); setJob(job_id);
+      poll.current=setInterval(async()=>{
+        const s=await api.job(job_id);
+        if(s.status==='running'||s.status==='queued')setProg(s);
+        else if(s.status==='done'){clearInterval(poll.current);setProg(p=>({...p,percent:100}));setView('done');}
+        else if(s.status==='error'){clearInterval(poll.current);setErr(s.error||'failed');setView('error');}
+      },1600);
+    }catch(e){setErr(e.message);setView('error');}
+  },[prompt,style,lang]);
+  const reset=()=>{clearInterval(poll.current);setView('form');setJob(null);setErr('');};
+
+  if(view==='form') return html`<div>
+    <div class="hero"><h2>Turn a prompt into a <span class="g">cinematic video</span>.</h2>
+      <p>Describe a topic, pick a style, generate a fully narrated, subtitled video.</p></div>
+    <div class="card">
+      <div class="label">Your prompt</div>
+      <textarea style=${{minHeight:'90px'}} placeholder="e.g. How mRNA vaccines teach your cells to fight viruses"
+        value=${prompt} onInput=${e=>setPrompt(e.target.value)}></textarea>
+      <div class="label" style=${{marginTop:'22px'}}>Visual style</div>
+      <${StylePicker} styles=${styles} value=${style} onChange=${setStyle}/>
+      <div class="label" style=${{marginTop:'22px'}}>Narration · accent & language</div>
+      <${LangPicker} langs=${langs} value=${lang} onChange=${setLang}/>
+      <button class="gen" style=${{marginTop:'22px'}} disabled=${!prompt.trim()} onClick=${start}>✦ Generate Video</button>
+    </div></div>`;
+  if(view==='progress') return html`<div>
+    <div class="hero"><h2>Generating…</h2><p>${prompt}</p></div>
+    <div class="card">
+      <div class="prog-head"><div class="prog-phase"><span class="spin"></span>${prog.phase}</div><div class="prog-pct">${prog.percent}%</div></div>
+      <div class="bar"><div style=${{width:prog.percent+'%'}}></div></div>
+      ${prog.scenes_total?html`<div class="meta">Visuals: <b style=${{color:'#ece9f5'}}>${prog.scenes_done}</b> / ${prog.scenes_total} scenes</div>`:null}
+      <div class="term">${prog.tail||'starting…'}</div>
+    </div></div>`;
+  if(view==='done') return html`<div>
+    <div class="hero"><h2>✨ Your video is ready</h2><p>${prompt}</p></div>
+    <div class="card"><video src=${'/api/jobs/'+job+'/video'} controls autoplay playsinline></video>
+      <div class="row"><a class="btn-2 btn-dl" href=${'/api/jobs/'+job+'/download'}>⬇ Download MP4</a>
+        <div class="btn-2 btn-again" onClick=${reset}>↻ Generate another</div></div></div></div>`;
+  return html`<div><div class="hero"><h2>Something went wrong</h2></div>
+    <div class="card"><div class="errbox">${err}</div>
+      <div class="row"><div class="btn-2 btn-again" onClick=${reset}>← Try again</div></div></div></div>`;
+}
+
+/* ───────────────── batch mode ───────────────── */
+const TERMINAL = new Set(['done','error','interrupted']);
+function JobCard({ id, prompt, style }) {
+  const [s,setS]=useState({status:'queued',phase:'Queued',percent:0}); const poll=useRef(null);
+  useEffect(()=>{
+    poll.current=setInterval(async()=>{
+      try{ const j=await api.job(id); setS(j);
+        if(TERMINAL.has(j.status))clearInterval(poll.current);
+      }catch(e){}
+    },1800);
+    return ()=>clearInterval(poll.current);
+  },[id]);
+  const badge=html`<span class="jbadge">${style}</span>`;
+  return html`<div class="jcard">
+    ${badge}<div class="jp">${prompt}</div>
+    ${s.status==='done'?html`
+      <video src=${'/api/jobs/'+id+'/video'} controls playsinline></video>
+      <a class="mini-dl" href=${'/api/jobs/'+id+'/download'}>⬇ Download</a>`
+    : (s.status==='error'||s.status==='interrupted')?html`<div class="jstat"><span class="jerr">✗ ${s.error||s.status}</span></div>`
+    : html`<div class="jstat"><span>${s.phase||s.status}</span><span class="pct">${s.percent||0}%</span></div>
+           <div class="bar"><div style=${{width:(s.percent||0)+'%'}}></div></div>`}
+  </div>`;
+}
+
+const MAX_ROWS = 12;
+function Batch({ styles, langs }) {
+  // Each row is its own video: a full paragraph prompt + its own style + language.
+  const [rows,setRows]=useState([{prompt:'',style:'educational',lang:'indian_english'}]);
+  const [jobs,setJobs]=useState([]); const [cap,setCap]=useState(null);
+  const capPoll=useRef(null);
+
+  useEffect(()=>{
+    const tick=async()=>{try{setCap(await api.stats());}catch(e){}};
+    tick(); capPoll.current=setInterval(tick,2000);
+    api.jobs().then(list=>{ if(list&&list.length) setJobs(list.map(j=>({id:j.id,prompt:j.prompt,style:j.style}))); }).catch(()=>{});
+    return ()=>clearInterval(capPoll.current);
+  },[]);
+
+  const setRow=(i,k,v)=>setRows(rs=>rs.map((r,idx)=>idx===i?{...r,[k]:v}:r));
+  const addRow=()=>setRows(rs=>rs.length>=MAX_ROWS?rs:[...rs,{prompt:'',style:rs[rs.length-1].style,lang:rs[rs.length-1].lang}]);
+  const delRow=(i)=>setRows(rs=>rs.length===1?rs:rs.filter((_,idx)=>idx!==i));
+  const valid=rows.filter(r=>r.prompt.trim());
+
+  const launch=useCallback(async()=>{
+    const created=[];
+    for(const r of valid){
+      try{ const {job_id}=await api.gen(r.prompt.trim(),r.style,r.lang); created.push({id:job_id,prompt:r.prompt.trim(),style:r.style}); }
+      catch(e){}
+    }
+    setJobs(j=>[...created,...j]);
+    setRows([{prompt:'',style:'educational',lang:'indian_english'}]);
+  },[valid]);
+
+  return html`<div>
+    <div class="hero"><h2>Batch <span class="g">generate</span> — up to ${MAX_ROWS} videos.</h2>
+      <p>One card per video: paste the full prompt (paragraphs are fine) and choose its own style + language. They run in parallel up to the server's limit; the rest queue automatically.</p></div>
+    ${cap?html`<div class="cap">
+      <span class="pill">Capacity</span><span class="sep">·</span>
+      <span class="run">▶ ${cap.running} running</span>
+      <span class="q">◷ ${cap.queued} queued</span>
+      <span class="dn">✓ ${cap.done} done</span>
+      <span class="sep">·</span><span style=${{color:'#56546e'}}>max ${cap.max_concurrent} at a time${cap.smoke_test?' (SMOKE)':''}</span>
+    </div>`:null}
+
+    ${rows.map((r,i)=>html`
+      <div class="card composer" key=${i}>
+        <div class="composer-head">
+          <span class="composer-num">Video ${i+1}</span>
+          ${rows.length>1?html`<button class="composer-del" onClick=${()=>delRow(i)} title="remove">✕</button>`:null}
+        </div>
+        <textarea style=${{minHeight:'110px'}} placeholder="Paste the full prompt for this video (a paragraph is fine)…"
+          value=${r.prompt} onInput=${e=>setRow(i,'prompt',e.target.value)}></textarea>
+        <div class="composer-controls">
+          <div class="ctrl">
+            <div class="ctrl-label">Style</div>
+            <select value=${r.style} onChange=${e=>setRow(i,'style',e.target.value)}>
+              ${styles.map(s=>html`<option key=${s.key} value=${s.key}>${s.emoji} ${s.label}</option>`)}
+            </select>
+          </div>
+          <div class="ctrl">
+            <div class="ctrl-label">Narration</div>
+            <select value=${r.lang} onChange=${e=>setRow(i,'lang',e.target.value)}>
+              ${langs.map(l=>html`<option key=${l.key} value=${l.key}>${l.emoji} ${l.label}</option>`)}
+            </select>
+          </div>
+        </div>
+      </div>`)}
+
+    <div class="composer-actions">
+      <button class="add-row" disabled=${rows.length>=MAX_ROWS} onClick=${addRow}>＋ Add another video${rows.length>=MAX_ROWS?` (max ${MAX_ROWS})`:''}</button>
+    </div>
+    <button class="gen" disabled=${!valid.length} onClick=${launch}>✦ Generate ${valid.length||''} ${valid.length===1?'Video':'Videos'}</button>
+
+    ${jobs.length?html`<div style=${{marginTop:'28px'}}>
+      <div class="label">Jobs (${jobs.length})</div>
+      <div class="grid">${jobs.map(j=>html`<${JobCard} key=${j.id} id=${j.id} prompt=${j.prompt} style=${j.style}/>`)}</div>
+    </div>`:null}
+  </div>`;
+}
+
+/* ───────────────── app shell ───────────────── */
+function App() {
+  const [styles,setStyles]=useState([]); const [langs,setLangs]=useState([]); const [mode,setMode]=useState('single');
+  useEffect(()=>{
+    api.styles().then(setStyles).catch(()=>{});
+    api.langs().then(setLangs).catch(()=>{});
+  },[]);
+  const ready = styles.length && langs.length;
+  return html`<div class="wrap">
+    <div class="brand"><div class="logo">🎬</div><div>
+      <h1>Faceless Video Studio</h1><div class="tag">AI cinematic video · Gemini · Imagen 4 · Veo 3</div></div></div>
+    <div class="tabs">
+      <button class=${'tab'+(mode==='single'?' on':'')} onClick=${()=>setMode('single')}>Single</button>
+      <button class=${'tab'+(mode==='batch'?' on':'')} onClick=${()=>setMode('batch')}>Batch · 10 at a time</button>
+    </div>
+    ${ready? (mode==='single'?html`<${Single} styles=${styles} langs=${langs}/>`:html`<${Batch} styles=${styles} langs=${langs}/>`)
+      : html`<div class="card">Loading…</div>`}
+  </div>`;
+}
+createRoot(document.getElementById('root')).render(html`<${App}/>`);
+</script>
+</body>
+</html>

@@ -18,41 +18,77 @@ import wave
 import shutil
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
-
 from google import genai
 from google.genai import types
-from google.cloud import texttospeech
-from google.oauth2 import service_account
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random_exponential,
+)
 
 from config import settings
 from schemas.models import AssetBundle, AudioAsset, CharacterRef, SceneScript, Storyboard, VideoScript, VisualAsset
 
 log = logging.getLogger(__name__)
 
+
+class VeoBlockedError(RuntimeError):
+    """Veo completed but returned no video — a safety/RAI filter block.
+    Re-submitting the same prompt is pointless, so this is NOT retried."""
+
+
+class ImagenBlockedError(RuntimeError):
+    """Imagen returned no images — a safety filter block. Deterministic for a
+    given prompt, so this is NOT retried (avoids a multi-hour retry hang)."""
+
 # Deep dramatic voices available in Gemini TTS
 # Charon = deep dramatic male, Fenrir = intense male, Kore = calm female
 _TTS_VOICE = settings.GEMINI_TTS_VOICE
 
-_ENRICHMENT_SYSTEM = """You are a veteran cinematographer writing prompts for Veo 3.0, 
-Google's state-of-the-art AI video generator. Your job is to transform draft video 
-descriptions into hyper-detailed, production-ready prompts that produce cinematic masterpieces.
+def _build_enrichment_system(style: dict) -> str:
+    """Build the enrichment system prompt for the ACTIVE visual style.
+
+    The render medium is the single biggest lever on style consistency: a
+    hardcoded photoreal prompt drags Ghibli/3D-textbook scenes back toward
+    live-action. So we make the medium mandatory and adapt the subject rules
+    to whether the style is photoreal or illustrated/rendered."""
+    medium = style.get("medium", "photorealistic cinematic film")
+    photoreal = style.get("photoreal", True)
+
+    if photoreal:
+        subject_rule = (
+            "- When a person is present, capture authentic emotion via micro-expressions and faces\n"
+            "- Use real-camera language: lens, depth-of-field, film grain, bokeh"
+        )
+    else:
+        subject_rule = (
+            f"- Render EVERY element strictly in this medium: {medium}\n"
+            "- Do NOT describe photorealistic skin, real-camera lenses, film grain, or live-action realism\n"
+            "- Keep the illustrated/rendered look identical in every described element"
+        )
+
+    return f"""You are a veteran art director writing prompts for Veo 3.0, Google's
+state-of-the-art AI video generator. Transform draft descriptions into hyper-detailed,
+production-ready prompts whose every frame matches ONE consistent visual medium.
+
+RENDER MEDIUM (MANDATORY — every frame MUST look exactly like this):
+{medium}
 
 RULES:
 - Output ONLY the rewritten prompt (60-100 words). No explanations, no labels.
-- Start with the EXACT camera movement and shot type
-- Describe ONLY visible, tangible physical objects and environments
-- Focus heavily on the human element, capturing highly authentic micro-expressions and raw emotion on the character's face
-- Frame the character dynamically (e.g., extreme close-up on eyes, over-the-shoulder)
-- Name the lighting technique (chiaroscuro, volumetric, rim light, etc.)
-- Include lens/depth-of-field (shallow DOF, anamorphic, wide-angle, macro)
-- State the color palette (teal-orange, cold desaturated, warm amber)
-- End with an ambient audio cue for Veo's native audio generation
-- Every element must be SPECIFIC to the narration context — not generic atmosphere
-- Mandate perfectly smooth, highly dynamic cinematic camera movements to ensure the video does not look static.
-- IMPORTANT SAFETY RULE: AVOID overly graphic, violent, or intensely terrifying descriptions (e.g. no "raw terror", "screaming", "panic"). Express emotion through profound but safe human expressions (tears, subtle smiles, longing).
-- Use professional cinematography terminology throughout"""
+- The prompt MUST OPEN by naming the render medium above, then the camera move.
+- Describe ONLY visible, tangible physical objects and environments.
+{subject_rule}
+- Name the lighting technique (chiaroscuro, volumetric, rim light, dappled, etc.).
+- State the dominant color palette for the shot.
+- End with a brief ambient audio cue.
+- Every element must be SPECIFIC to the narration context — not generic atmosphere.
+- Mandate smooth, dynamic camera movement so the shot is never static.
+- SAFETY: avoid graphic/violent/terrifying wording (no "raw terror", "screaming",
+  "panic"); express emotion safely (tears, subtle smiles, longing)."""
+
 
 class AssetFactory:
     def __init__(self) -> None:
@@ -97,14 +133,25 @@ class AssetFactory:
 
     # ── audio via Gemini TTS ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _tts_style() -> tuple[str, str]:
+        """Resolve (voice, delivery-tone) for the active visual style."""
+        preset = settings.TTS_STYLE_PRESETS.get(settings.VISUAL_STYLE)
+        if preset:
+            return preset["voice"], preset["tone"]
+        # No style-specific entry → fall back to env voice + the default tone.
+        return settings.GEMINI_TTS_VOICE, settings.TTS_DEFAULT["tone"]
+
     def _generate_audio(self, script: VideoScript) -> list[AudioAsset]:
+        voice, tone = self._tts_style()
+        log.info("  [audio] voice=%s, directed delivery for style '%s'", voice, settings.VISUAL_STYLE)
         assets: list[AudioAsset] = []
         for scene in script.scenes:
             wav_path = self._audio_dir / f"scene_{scene.scene_id}.wav"
             if wav_path.exists():
                 log.info("  [audio] scene %d cached", scene.scene_id)
             else:
-                self._tts(scene.narration, wav_path)
+                self._tts(scene.narration, wav_path, voice, tone)
                 log.info("  [audio] scene %d -> %s", scene.scene_id, wav_path.name)
 
             duration_ms = self._wav_duration_ms(wav_path)
@@ -112,24 +159,35 @@ class AssetFactory:
         return assets
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=20))
-    def _tts(self, text: str, dest: Path) -> None:
-        creds = service_account.Credentials.from_service_account_file(settings.VEO_SERVICE_ACCOUNT_PATH)
-        client = texttospeech.TextToSpeechClient(credentials=creds)
-        
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="hi-IN",
-            name="hi-IN-Neural2-B"
+    def _tts(self, text: str, dest: Path, voice: str | None = None, tone: str | None = None) -> None:
+        voice = voice or settings.GEMINI_TTS_VOICE
+        # Style prompt: Gemini TTS interprets a leading directive as DELIVERY guidance
+        # (it speaks only the text after it). This turns flat read-aloud into a
+        # directed performance — the biggest single TTS quality lever, and free.
+        # The active narration profile adds the accent/language (e.g. Indian English).
+        directive = tone or settings.TTS_DEFAULT["tone"]
+        profile = settings.narration_profile()
+        if profile.get("tts_directive"):
+            directive = f"{directive}, {profile['tts_directive']}"
+        contents = f"{directive}:\n\n{text}"
+        response = self._client.models.generate_content(
+            model=settings.GEMINI_TTS_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+                    )
+                ),
+            ),
         )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=24000
-        )
-        
-        response = client.synthesize_speech(
-            input=synthesis_input, voice=voice, audio_config=audio_config
-        )
-        dest.write_bytes(response.audio_content)
+        audio_data = response.candidates[0].content.parts[0].inline_data.data
+        with wave.open(str(dest), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)
+            wf.writeframes(audio_data)
 
     @staticmethod
     def _wav_duration_ms(path: Path) -> int:
@@ -171,7 +229,7 @@ class AssetFactory:
 
             try:
                 response = self._client.models.generate_images(
-                    model='imagen-4.0-generate-001',
+                    model=settings.GEMINI_IMAGE_MODEL,
                     prompt=prompt,
                     config=types.GenerateImagesConfig(
                         number_of_images=1,
@@ -214,9 +272,18 @@ class AssetFactory:
     # ── prompt enrichment ────────────────────────────────────────────────────
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def _enrich_video_prompt(self, scene: SceneScript, style_brief: str, character_anchor: str = "") -> str:
-        """Use Gemini to transform a Phase 2 video prompt into a Veo-optimized
-        cinematic masterpiece prompt with full directorial detail."""
+    def _enrich_video_prompt(
+        self,
+        scene: SceneScript,
+        style_brief: str,
+        character_anchor: str = "",
+        prev_narration: str = "",
+        next_narration: str = "",
+    ) -> str:
+        """Transform a Phase 2 prompt into a Veo-optimized cinematic prompt.
+
+        Accepts adjacent scene narrations to produce visuals that flow
+        naturally from the previous scene and bridge into the next."""
 
         style = settings.VISUAL_STYLE_PRESETS.get(
             settings.VISUAL_STYLE,
@@ -227,35 +294,58 @@ class AssetFactory:
         if character_anchor:
             char_block = (
                 f"\n{character_anchor}\n\n"
-                f"CRITICAL: You MUST use the EXACT physical descriptions above for any character "
-                f"in this scene. Do NOT change their appearance, clothing, age, or features.\n"
+                f"CRITICAL: Use EXACT physical descriptions above for any character. "
+                f"Do NOT alter appearance, clothing, age, or features.\n"
             )
 
+        continuity_block = ""
+        if prev_narration:
+            continuity_block += (
+                f"\nPREVIOUS SCENE (for visual continuity — start visually near where that ended):\n"
+                f'"{prev_narration}"\n'
+            )
+        if next_narration:
+            continuity_block += (
+                f"\nNEXT SCENE (visually lead INTO this — end on a frame that transitions naturally):\n"
+                f'"{next_narration}"\n'
+            )
+
+        medium = style.get("medium", "photorealistic cinematic film")
         prompt = (
+            f"RENDER MEDIUM (every frame must look like this): {medium}\n"
             f"VISUAL STYLE DNA: {style_brief}\n"
             f"Color palette: {style['color_palette']}\n"
-            f"Lighting style: {style['lighting']}\n"
-            f"Lens: {style['lens']}\n"
+            f"Lighting: {style['lighting']}\n"
+            f"Lens/medium: {style['lens']}\n"
             f"Textures: {style['texture']}\n"
-            f"{char_block}\n"
-            f"NARRATION (for context — the visual must illustrate this):\n"
+            f"{char_block}"
+            f"{continuity_block}\n"
+            f"CURRENT NARRATION (visual must illustrate this PRECISELY):\n"
             f'"{scene.narration}"\n\n'
-            f"DRAFT VIDEO PROMPT to enhance:\n"
+            f"DRAFT PROMPT to enhance:\n"
             f'"{scene.video_prompt}"\n\n'
-            f"(60-100 words) optimized for Veo 3.0. Produce highly literal, textbook-style, hyper-realistic 3D scientific visualizations or diagrams. Do NOT include human characters or faces unless strictly necessary. Focus entirely on the academic subject matter. "
-            f"CRITICAL: Do NOT use real names of public figures or historical people to avoid safety filters. "
-            f"Only the rewritten prompt, nothing else."
+            f"Rewrite as a 60-100 word Veo 3.0 prompt. Requirements:\n"
+            f"- OPEN by naming the render medium above, so the style stays consistent\n"
+            f"- ZERO vague mood words — describe ONLY what the camera sees\n"
+            f"- Start the action with an explicit camera move; end with an ambient audio cue\n"
+            f"- No real names of public figures (safety filter risk)\n"
+            f"- Visual must PRECISELY match the current narration\n"
+            f"- Camera movement must naturally BRIDGE from previous scene and LEAD INTO next\n"
+            f"Output ONLY the rewritten prompt, nothing else."
         )
 
         response = self._client.models.generate_content(
             model=settings.GEMINI_SCRIPT_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=_ENRICHMENT_SYSTEM,
+                system_instruction=_build_enrichment_system(style),
                 temperature=0.7,
+                # Disable "thinking" so the model can't leak its reasoning preamble
+                # ("THINKING PROCESS: ...") into the prompt text fed to Veo.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        enriched = response.text.strip().strip('"').strip("'")
+        enriched = self._sanitize_enriched(response.text, scene)
         log.info(
             "  [enrich] scene %d: %d->%d words",
             scene.scene_id,
@@ -264,82 +354,299 @@ class AssetFactory:
         )
         return enriched
 
-    # ── visuals via Imagen 3.0 & Veo 3.0 ─────────────────────────────────────
+    @staticmethod
+    def _sanitize_enriched(text: str | None, scene: SceneScript) -> str:
+        """Defend against a polluted enrichment response.
+
+        Even with thinking disabled, the model can occasionally prepend a
+        reasoning preamble or run far over length. A valid Veo prompt is ~60-100
+        words; if the output is clearly broken we drop the preamble, and as a last
+        resort fall back to the clean Phase 2 video_prompt."""
+        import re
+
+        t = (text or "").strip().strip('"').strip("'")
+
+        # Drop a leaked reasoning preamble — keep the final paragraph (the real prompt).
+        if re.match(r"(?i)^\s*(think|thinking process|reasoning|here'?s|okay|the user)\b", t):
+            paras = [p.strip() for p in t.split("\n\n") if p.strip()]
+            if paras:
+                t = paras[-1]
+
+        # Hard length guard: anything wildly over a prompt's length is polluted.
+        if not t or len(t.split()) > 160:
+            log.warning(
+                "  [enrich] scene %d enriched prompt unusable (%d words) — using Phase 2 prompt",
+                scene.scene_id, len(t.split()),
+            )
+            t = scene.video_prompt
+
+        return t
+
+    # ── visuals via Imagen 4 & Veo 3.0 ───────────────────────────────────────
 
     def _generate_visuals(self, script: VideoScript) -> list[VisualAsset]:
+        """Concurrent two-pass generation:
+        Pass 1 — enrich prompt + generate Imagen keyframe for every veo scene (parallel).
+        Pass 2 — generate Veo videos (parallel); blocked/failed scenes fall back to the
+                  keyframe (Ken Burns in Phase 4) instead of crashing the run.
+
+        Veo polling is I/O-bound, so a thread pool of VEO_CONCURRENCY workers turns a
+        serial N×(render time) wait into roughly one clip's wall-time."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from pipeline.phase3_animator import AnimatorFactory
+
+        workers = max(1, settings.VEO_CONCURRENCY)
+        veo_scenes = [s for s in script.scenes if s.engine_type == "veo_cinematic"]
+        veo_scene_ids = [s.scene_id for s in veo_scenes]
+        scene_map = {s.scene_id: s for s in script.scenes}
+
+        enriched_map: dict[int, str] = {}
+        keyframe_map: dict[int, Path] = {}
+
+        # ── Pass 1: enrich + keyframe (parallel) ─────────────────────────────
+        def _prep(scene: SceneScript) -> tuple[int, str, Path]:
+            idx = veo_scene_ids.index(scene.scene_id)
+            prev_n = scene_map[veo_scene_ids[idx - 1]].narration if idx > 0 else ""
+            next_n = scene_map[veo_scene_ids[idx + 1]].narration if idx + 1 < len(veo_scene_ids) else ""
+            anchor = self._build_character_anchor(script, scene)
+            try:
+                enriched = self._enrich_video_prompt(scene, script.visual_style_brief, anchor, prev_n, next_n)
+            except Exception as exc:
+                # Enrichment (Gemini text) rate-limited/failed — fall back to the clean
+                # Phase 2 video_prompt instead of crashing the whole job.
+                log.warning("  [enrich] scene %d failed (%s) — using Phase 2 prompt", scene.scene_id, exc)
+                enriched = scene.video_prompt
+            try:
+                kf = self._gen_keyframe_image(scene, enriched, anchor)
+            except Exception as exc:
+                # Imagen blocked/failed — render a fallback slide so the scene is still
+                # covered and the video completes (never crash the whole run on one scene).
+                log.warning("  [visual/imagen4] scene %d keyframe failed (%s) — fallback slide", scene.scene_id, exc)
+                kf = self._make_fallback_slide(scene)
+            return scene.scene_id, enriched, kf
+
+        log.info("  [visual] Pass 1 – enrich+keyframe for %d scenes (%d workers)", len(veo_scenes), workers)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for sid, enriched, kf in ex.map(_prep, veo_scenes):
+                enriched_map[sid] = enriched
+                keyframe_map[sid] = kf
+
+        # ── Pass 2: Veo clips (parallel, with graceful fallback) ─────────────
+        def _veo(scene: SceneScript) -> VisualAsset:
+            sid = scene.scene_id
+            idx = veo_scene_ids.index(sid)
+            next_kf = keyframe_map.get(veo_scene_ids[idx + 1]) if idx + 1 < len(veo_scene_ids) else None
+            try:
+                veo_path = self._gen_veo(scene, enriched_map[sid], keyframe_map[sid], next_kf)
+            except Exception as exc:
+                log.warning(
+                    "  [visual/veo3] scene %d failed (%s) — falling back to Ken Burns keyframe",
+                    sid, exc,
+                )
+                veo_path = self._video_dir / f"scene_{sid}_veo.mp4"  # nonexistent → Phase 4 fallback
+            return VisualAsset(scene_id=sid, raw_video_path=veo_path, keyframe_image_path=keyframe_map[sid])
+
+        log.info("  [visual] Pass 2 – Veo render for %d scenes (%d workers)", len(veo_scenes), workers)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            veo_assets = {a.scene_id: a for a in ex.map(_veo, veo_scenes)}
+
+        # ── code_animator scenes (sequential — Playwright is not thread-safe) ─
+        anim_assets: dict[int, VisualAsset] = {}
+        anim_scenes = [s for s in script.scenes if s.engine_type == "code_animator"]
+        if anim_scenes:
+            animator = AnimatorFactory()
+            for scene in anim_scenes:
+                try:
+                    anim_assets[scene.scene_id] = animator._gen_animation(scene)
+                except Exception as exc:
+                    # Animator failed (e.g. headless browser issue) — fall back to the
+                    # Veo path so the scene still gets an on-topic visual, never a crash.
+                    log.warning(
+                        "  [animator] scene %d failed (%s) — falling back to Veo path",
+                        scene.scene_id, exc,
+                    )
+                    anim_assets[scene.scene_id] = self._veo_fallback_asset(scene, script)
+
+        # ── reassemble in original scene order ───────────────────────────────
         assets: list[VisualAsset] = []
         for scene in script.scenes:
-            # Build character anchor for this specific scene
-            character_anchor = self._build_character_anchor(script, scene)
-            # 1. Enrich prompt (now with character descriptions injected)
-            enriched_prompt = self._enrich_video_prompt(scene, script.visual_style_brief, character_anchor)
-            # 2. Generate perfect composition image via Imagen 3
-            keyframe_path = self._gen_keyframe_image(scene, enriched_prompt, character_anchor)
-            # 3. Pass image to Veo to animate
-            veo_path = self._gen_veo(scene, enriched_prompt, keyframe_path)
-            
-            assets.append(VisualAsset(
-                scene_id=scene.scene_id,
-                raw_video_path=veo_path,
-                keyframe_image_path=keyframe_path
-            ))
+            if scene.scene_id in veo_assets:
+                assets.append(veo_assets[scene.scene_id])
+            else:
+                assets.append(anim_assets[scene.scene_id])
         return assets
 
-    @retry(stop=stop_after_attempt(50), wait=wait_exponential(multiplier=3, min=30, max=300))
+    @staticmethod
+    def _active_style() -> dict:
+        """The active VISUAL_STYLE preset (falls back to dark_cinematic)."""
+        return settings.VISUAL_STYLE_PRESETS.get(
+            settings.VISUAL_STYLE, settings.VISUAL_STYLE_PRESETS["dark_cinematic"]
+        )
+
+    def _veo_fallback_asset(self, scene: SceneScript, script: VideoScript) -> VisualAsset:
+        """Run one scene through the full Veo path (enrich → keyframe → Veo) with all
+        the usual fallbacks. Used when the code_animator path fails for a scene."""
+        anchor = self._build_character_anchor(script, scene)
+        try:
+            enriched = self._enrich_video_prompt(scene, script.visual_style_brief, anchor)
+        except Exception as exc:
+            log.warning("  [animator→veo] scene %d enrich failed (%s) — using Phase 2 prompt", scene.scene_id, exc)
+            enriched = scene.video_prompt
+        try:
+            keyframe = self._gen_keyframe_image(scene, enriched, anchor)
+        except Exception as exc:
+            log.warning("  [animator→veo] scene %d keyframe failed (%s) — fallback slide", scene.scene_id, exc)
+            keyframe = self._make_fallback_slide(scene)
+        try:
+            veo_path = self._gen_veo(scene, enriched, keyframe, None)
+        except Exception as exc:
+            log.warning("  [animator→veo] scene %d Veo failed (%s) — Ken Burns keyframe", scene.scene_id, exc)
+            veo_path = self._video_dir / f"scene_{scene.scene_id}_veo.mp4"  # nonexistent → Phase 4 fallback
+        return VisualAsset(scene_id=scene.scene_id, raw_video_path=veo_path, keyframe_image_path=keyframe)
+
+    @retry(
+        # Many keyframes fire at once across parallel jobs → Imagen rate-limits (429
+        # ClientError). Retry hard with JITTERED backoff so the herd spreads out and
+        # transient limits recover, instead of mass-falling-back to slides.
+        # (A real safety block raises ImagenBlockedError, which is NOT retried.)
+        stop=stop_after_attempt(8),
+        wait=wait_random_exponential(multiplier=2, min=4, max=120),
+        retry=retry_if_not_exception_type(ImagenBlockedError),
+    )
     def _gen_keyframe_image(self, scene: SceneScript, enriched_prompt: str, character_anchor: str = "") -> Path:
         dest = self._video_dir / f"scene_{scene.scene_id}_keyframe.png"
         if dest.exists():
-            log.info("  [visual/imagen3] scene %d keyframe cached", scene.scene_id)
+            log.info("  [visual/imagen4] scene %d keyframe cached", scene.scene_id)
             return dest
 
-        # Prepend character descriptions to anchor the image to the same people
-        full_prompt = enriched_prompt
-        if character_anchor:
-            full_prompt = (
-                f"{character_anchor}\n\n"
-                f"SCENE VISUAL:\n{enriched_prompt}"
-            )
+        # Lead with the render medium so Imagen locks the style for this keyframe;
+        # the keyframe is Veo's start image, so getting the style right here anchors
+        # the whole clip.
+        medium = self._active_style().get("medium", "")
+        medium_line = f"RENDER STYLE: {medium}\n\n" if medium else ""
+        body = (
+            f"{character_anchor}\n\nSCENE VISUAL:\n{enriched_prompt}"
+            if character_anchor else enriched_prompt
+        )
+        full_prompt = f"{medium_line}{body}"
 
-        log.info("  [visual/imagen3] scene %d generating keyframe...", scene.scene_id)
+        log.info("  [visual/imagen4] scene %d generating keyframe…", scene.scene_id)
         response = self._client.models.generate_images(
-            model='imagen-4.0-generate-001',
+            model=settings.GEMINI_IMAGE_MODEL,
             prompt=full_prompt,
             config=types.GenerateImagesConfig(
                 number_of_images=1,
                 aspect_ratio="16:9",
-                output_mime_type="image/png"
-            )
+                output_mime_type="image/png",
+            ),
         )
         if not response.generated_images:
-            raise RuntimeError(f"Imagen returned no images for scene {scene.scene_id} (likely safety filter block). Prompt was: {full_prompt}")
-            
-        image_bytes = response.generated_images[0].image.image_bytes
-        dest.write_bytes(image_bytes)
+            # Safety filter — deterministic, do not retry; caller makes a fallback slide.
+            raise ImagenBlockedError(
+                f"Imagen returned no images for scene {scene.scene_id} "
+                f"(safety filter). Prompt: {full_prompt[:200]}"
+            )
+        dest.write_bytes(response.generated_images[0].image.image_bytes)
         return dest
 
-    def _gen_veo(self, scene: SceneScript, enriched_prompt: str, keyframe_path: Path) -> Path:
+    @staticmethod
+    def _load_font(size: int, devanagari: bool = False):
+        """Best-available TrueType font (Devanagari-capable when needed)."""
+        from PIL import ImageFont
+        latin = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        deva = [
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        ]
+        for path in (deva + latin) if devanagari else latin:
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def _make_fallback_slide(self, scene: SceneScript) -> Path:
+        """When Imagen blocks/fails, render the scene's NARRATION as a clean text card
+        (not a blank gradient) so the scene always has meaningful, on-topic visual that
+        matches the audio. Guarantees the video never shows 'audio but nothing on screen'."""
+        from PIL import Image, ImageDraw
+
+        dest = self._video_dir / f"scene_{scene.scene_id}_keyframe.png"
+        W, H = 1920, 1080
+        img = Image.new("RGB", (W, H), (10, 14, 28))
+        draw = ImageDraw.Draw(img)
+        for y in range(H):  # subtle vertical gradient
+            shade = int(10 + 22 * (y / H))
+            draw.line([(0, y), (W, y)], fill=(shade, shade + 4, shade + 14))
+        draw.rectangle([60, 60, W - 60, H - 60], outline=(70, 90, 140), width=3)
+
+        text = (scene.narration or "").strip()
+        is_deva = any("ऀ" <= ch <= "ॿ" for ch in text)
+        font = self._load_font(64, devanagari=is_deva)
+
+        # word-wrap to fit within the inner margin
+        max_w = W - 360
+        words, lines, cur = text.split(), [], ""
+        for w in words:
+            trial = f"{cur} {w}".strip()
+            if draw.textlength(trial, font=font) <= max_w:
+                cur = trial
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        lines = lines[:6] or [" "]
+
+        line_h = int(font.size * 1.4)
+        total_h = line_h * len(lines)
+        y = (H - total_h) // 2
+        for ln in lines:
+            w = draw.textlength(ln, font=font)
+            x = (W - w) // 2
+            draw.text((x + 2, y + 2), ln, font=font, fill=(0, 0, 0))      # shadow
+            draw.text((x, y), ln, font=font, fill=(235, 233, 245))         # text
+            y += line_h
+
+        img.save(str(dest))
+        log.info("  [visual/imagen4] scene %d -> text-card fallback", scene.scene_id)
+        return dest
+
+    def _gen_veo(
+        self,
+        scene: SceneScript,
+        enriched_prompt: str,
+        keyframe_path: Path,
+        next_keyframe_path: Path | None = None,
+    ) -> Path:
         dest = self._video_dir / f"scene_{scene.scene_id}_veo.mp4"
         if dest.exists():
             log.info("  [visual/veo3] scene %d cached", scene.scene_id)
             return dest
 
-        log.info(
-            "  [visual/veo3] scene %d enriched prompt:\n    %s",
-            scene.scene_id,
-            enriched_prompt[:200],
-        )
-
-        # How many 8s clips do we need to cover the narration without looping?
         audio_secs = (scene.duration_ms or 8000) / 1000.0
         n_clips = max(1, math.ceil(audio_secs / 8))
-        n_request = min(n_clips, 4)  # Veo supports up to 4 per call
 
         log.info(
-            "  [visual/veo3] scene %d – requesting %d clip(s) for %.1fs narration",
-            scene.scene_id, n_request, audio_secs,
+            "  [visual/veo3] scene %d – %d clip(s) for %.1fs, prompt: %s…",
+            scene.scene_id, n_clips, audio_secs, enriched_prompt[:120],
         )
 
-        clips = [self._fetch_veo_clip(scene, enriched_prompt, keyframe_path, i) for i in range(n_request)]
+        clips: list[Path] = []
+        for i in range(n_clips):
+            # Only the final clip of the scene uses last_frame to bridge into next scene
+            use_last_frame = (i == n_clips - 1)
+            clip = self._fetch_veo_clip(
+                scene, enriched_prompt, keyframe_path, i,
+                next_keyframe_path if use_last_frame else None,
+            )
+            clips.append(clip)
 
         if len(clips) == 1:
             clips[0].rename(dest)
@@ -348,58 +655,116 @@ class AssetFactory:
             for c in clips:
                 c.unlink(missing_ok=True)
 
-        log.info("  [visual/veo3] scene %d -> %s (%.1fs covered)", scene.scene_id, dest.name, n_request * 8)
+        log.info("  [visual/veo3] scene %d -> %s", scene.scene_id, dest.name)
         return dest
 
-    @retry(stop=stop_after_attempt(50), wait=wait_exponential(multiplier=3, min=30, max=300))
-    def _fetch_veo_clip(self, scene: SceneScript, prompt: str, keyframe_path: Path, clip_idx: int) -> Path:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=10, max=60),
+        retry=retry_if_not_exception_type(VeoBlockedError),
+    )
+    def _fetch_veo_clip(
+        self,
+        scene: SceneScript,
+        prompt: str,
+        keyframe_path: Path,
+        clip_idx: int,
+        next_keyframe_path: Path | None = None,
+    ) -> Path:
         dest = self._video_dir / f"scene_{scene.scene_id}_clip{clip_idx}.mp4"
         if dest.exists():
             return dest
 
-        # Build Veo config
+        start_image = types.Image(image_bytes=keyframe_path.read_bytes(), mime_type="image/png")
+
+        # last_frame (first+last-frame interpolation) gives perfect scene-to-scene
+        # handoff, BUT it is Veo's slow/expensive path (10x+ render time). It is
+        # OFF by default; the xfade dissolve in Phase 4 + prompt-level continuity
+        # already produce smooth transitions. Enable via VEO_LAST_FRAME=true only
+        # if you need frame-exact handoffs and accept the render-time cost.
+        last_frame = None
+        if settings.VEO_LAST_FRAME and next_keyframe_path and next_keyframe_path.exists():
+            last_frame = types.Image(
+                image_bytes=next_keyframe_path.read_bytes(), mime_type="image/png"
+            )
+
+        # Style-aware negatives: each style declares exactly what to push Veo AWAY
+        # from (e.g. Ghibli negates 3D/photoreal; academic 3D negates photoreal but
+        # NOT "3D render"). Keeps the animation from drifting off the keyframe style.
+        style = self._active_style()
+        medium = style.get("medium", "")
+        negatives = (
+            "text overlay, watermark, logo, blurry, low quality, pixelated, "
+            "compression artifacts, static frame, no motion, handheld shake, "
+            "jump cut, duplicate frames, distorted proportions"
+        )
+        if style.get("negative_extra"):
+            negatives += ", " + style["negative_extra"]
+
+        # NOTE: generate_audio is NOT supported on AI Studio (Developer API) keys —
+        # only on Vertex/Enterprise. We omit it; Veo's audio track is discarded in
+        # Phase 4 (normalize_clip uses -an) since we supply our own narration + BGM.
         veo_config = types.GenerateVideosConfig(
             aspect_ratio="16:9",
             duration_seconds=8,
             number_of_videos=1,
-        )
-        
-        # In Veo image-to-video, we must pass the image in the source
-        image_obj = types.Image(
-            image_bytes=keyframe_path.read_bytes(),
-            mime_type="image/png"
-        )
-        source = types.GenerateVideosSource(
-            image=image_obj,
-            prompt="Cinematically pan and animate this scene with perfect smooth and highly dynamic cinematic camera movements. Add subtle environmental movement like smoke, dust, or gentle camera drift. " + prompt
+            negative_prompt=negatives,
+            last_frame=last_frame,  # None unless VEO_LAST_FRAME enabled
         )
 
+        # Lead the Veo prompt with the render medium so the animation preserves the
+        # keyframe's style instead of regressing toward generic photoreal video.
+        medium_prefix = f"{medium}. " if medium else ""
+        veo_prompt = (
+            f"{medium_prefix}Smooth camera movement animating this scene while keeping "
+            f"the exact visual style of the source image. "
+            f"Add subtle environmental motion (particles, haze, gentle drift). "
+            + prompt
+        )
+
+        t_submit = time.time()
         operation = self._client.models.generate_videos(
             model=settings.VEO_MODEL,
-            source=source,
+            prompt=veo_prompt,
+            image=start_image,
             config=veo_config,
         )
 
-        for attempt in range(90):
+        # Poll up to ~10 min, logging progress at INFO so a slow job is visible.
+        max_polls = 120
+        for attempt in range(max_polls):
             operation = self._client.operations.get(operation)
             if operation.done:
                 break
-            log.debug("  [veo3] scene %d clip %d polling (%ds)", scene.scene_id, clip_idx, (attempt + 1) * 5)
+            if attempt and attempt % 6 == 0:  # every ~30s
+                log.info(
+                    "  [veo3] scene %d clip %d still rendering (%.0fs elapsed)",
+                    scene.scene_id, clip_idx, time.time() - t_submit,
+                )
             time.sleep(5)
         else:
-            raise TimeoutError(f"Veo timed out for scene {scene.scene_id} clip {clip_idx}")
+            raise TimeoutError(
+                f"Veo timed out for scene {scene.scene_id} clip {clip_idx} "
+                f"after {time.time() - t_submit:.0f}s"
+            )
 
         if operation.error:
             raise RuntimeError(f"Veo error scene {scene.scene_id} clip {clip_idx}: {operation.error}")
-        if not operation.response:
-            raise RuntimeError(f"Veo returned no response for scene {scene.scene_id} clip {clip_idx}")
+        if not (operation.response and operation.response.generated_videos):
+            resp = operation.response
+            reasons = getattr(resp, "rai_media_filtered_reasons", None) if resp else None
+            count = getattr(resp, "rai_media_filtered_count", None) if resp else None
+            raise VeoBlockedError(
+                f"Veo returned no video for scene {scene.scene_id} clip {clip_idx} "
+                f"(safety filter). filtered_count={count} reasons={reasons}"
+            )
 
-        videos = operation.response.generated_videos
-        if not videos:
-            raise RuntimeError(f"Veo returned empty video list for scene {scene.scene_id} clip {clip_idx}")
-        generated = videos[0]
-        video_bytes = self._client.files.download(file=generated)
+        video_bytes = self._client.files.download(file=operation.response.generated_videos[0])
         dest.write_bytes(video_bytes)
+        log.info(
+            "  [veo3] scene %d clip %d done in %.0fs (%d bytes)",
+            scene.scene_id, clip_idx, time.time() - t_submit, len(video_bytes),
+        )
         return dest
 
     def _concat_clips(self, clips: list[Path], dest: Path) -> None:

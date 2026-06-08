@@ -1,0 +1,19 @@
+# One-command hosting:  docker compose up --build
+# Reads GEMINI_API_KEY from your shell env or a local .env file (compose auto-loads .env).
+services:
+  studio:
+    build: .
+    image: faceless-studio
+    ports:
+      - "8000:8000"
+    environment:
+      # REQUIRED — your Gemini API key (from https://aistudio.google.com/app/apikey)
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in your shell or a .env file}
+      # How many videos render in parallel (≈ this × 2 concurrent Veo calls).
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-10}
+    volumes:
+      # Persist generated videos + job history across restarts
+      - ./output:/app/output
+      # Optional: only needed if you switch Veo to a Vertex service account
+      # - ./credentials:/app/credentials:ro
+    restart: unless-stopped

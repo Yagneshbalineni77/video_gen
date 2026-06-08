@@ -211,12 +211,6 @@ def _log_html(lines: list[str]) -> str:
 
 def _run_phase(phase: int, extra_env: dict) -> bool:
     env = {**os.environ, **extra_env, "PYTHONUTF8": "1"}
-    ffmpeg_bin = (
-        r"C:\Users\kotes\AppData\Local\Microsoft\WinGet\Packages"
-        r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
-        r"\ffmpeg-8.1.1-full_build\bin"
-    )
-    env["PATH"] = env.get("PATH", "") + os.pathsep + ffmpeg_bin
 
     cmd = [sys.executable, str(ROOT / "main.py"), "--phase", str(phase)]
     st.session_state["phase_status"][phase] = "active"
@@ -375,14 +369,14 @@ if generate and not st.session_state["running"]:
         import datetime as _dt
         OUTPUT.mkdir(exist_ok=True)
         mock_trend = {
-            "scraped_at": _dt.datetime.utcnow().isoformat(),
+            "scraped_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "candidates": [],
             "top_concepts": [{
                 "video_id": "manual",
                 "title": topic_override,
                 "channel_title": "Manual",
                 "views": 500000,
-                "published_at": _dt.datetime.utcnow().isoformat(),
+                "published_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
                 "days_since_upload": 2.0,
                 "view_velocity": 250000.0,
                 "niche_keyword": niche.split(",")[0].strip(),
