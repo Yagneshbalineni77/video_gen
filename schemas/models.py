@@ -40,6 +40,12 @@ class SceneScript(BaseModel):
     image_prompt: str
     video_prompt: str
     engine_type: Literal["veo_cinematic", "code_animator"] = "veo_cinematic"
+    # For veo_cinematic scenes: how the clip is made.
+    #   "keyframe" (default) → Imagen keyframe → Veo animates it (control + character
+    #                          consistency; best for composed/character/static shots)
+    #   "direct"             → Veo text-to-video, NO keyframe (free, living motion;
+    #                          best for action/motion/event "hero" scenes)
+    veo_mode: Literal["keyframe", "direct"] = "keyframe"
     # Exact formula / equation / key term to pin on screen as a guaranteed-accurate
     # graphic (e.g. "F = ma", "CO₂ + 6H₂O → C₆H₁₂O₆"). Empty when the scene has no
     # critical text. Burned as a crisp overlay in Phase 4 — never AI-rendered, so it

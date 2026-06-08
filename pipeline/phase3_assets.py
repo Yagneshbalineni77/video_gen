@@ -402,10 +402,10 @@ class AssetFactory:
         scene_map = {s.scene_id: s for s in script.scenes}
 
         enriched_map: dict[int, str] = {}
-        keyframe_map: dict[int, Path] = {}
+        keyframe_map: dict[int, Path | None] = {}   # None for direct (text-to-video) scenes
 
-        # ── Pass 1: enrich + keyframe (parallel) ─────────────────────────────
-        def _prep(scene: SceneScript) -> tuple[int, str, Path]:
+        # ── Pass 1: enrich (always) + keyframe (skip for direct scenes) ──────
+        def _prep(scene: SceneScript) -> tuple[int, str, Path | None]:
             idx = veo_scene_ids.index(scene.scene_id)
             prev_n = scene_map[veo_scene_ids[idx - 1]].narration if idx > 0 else ""
             next_n = scene_map[veo_scene_ids[idx + 1]].narration if idx + 1 < len(veo_scene_ids) else ""
@@ -417,6 +417,8 @@ class AssetFactory:
                 # Phase 2 video_prompt instead of crashing the whole job.
                 log.warning("  [enrich] scene %d failed (%s) — using Phase 2 prompt", scene.scene_id, exc)
                 enriched = scene.video_prompt
+            if scene.veo_mode == "direct":
+                return scene.scene_id, enriched, None   # text-to-video → no keyframe needed
             try:
                 kf = self._gen_keyframe_image(scene, enriched, anchor)
             except Exception as exc:
@@ -437,15 +439,20 @@ class AssetFactory:
             sid = scene.scene_id
             idx = veo_scene_ids.index(sid)
             next_kf = keyframe_map.get(veo_scene_ids[idx + 1]) if idx + 1 < len(veo_scene_ids) else None
+            kf = keyframe_map.get(sid)   # None → Veo text-to-video (direct mode)
             try:
-                veo_path = self._gen_veo(scene, enriched_map[sid], keyframe_map[sid], next_kf)
+                veo_path = self._gen_veo(scene, enriched_map[sid], kf, next_kf)
             except Exception as exc:
                 log.warning(
-                    "  [visual/veo3] scene %d failed (%s) — falling back to Ken Burns keyframe",
-                    sid, exc,
+                    "  [visual/veo3] scene %d (%s) failed (%s) — falling back to keyframe card",
+                    sid, scene.veo_mode, exc,
                 )
+                # Direct scenes have no keyframe to Ken-Burns; make a text card so the
+                # scene is still covered. Keyframe-mode scenes already have their slide.
+                if kf is None:
+                    kf = self._make_fallback_slide(scene)
                 veo_path = self._video_dir / f"scene_{sid}_veo.mp4"  # nonexistent → Phase 4 fallback
-            return VisualAsset(scene_id=sid, raw_video_path=veo_path, keyframe_image_path=keyframe_map[sid])
+            return VisualAsset(scene_id=sid, raw_video_path=veo_path, keyframe_image_path=kf)
 
         log.info("  [visual] Pass 2 – Veo render for %d scenes (%d workers)", len(veo_scenes), workers)
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -622,9 +629,10 @@ class AssetFactory:
         self,
         scene: SceneScript,
         enriched_prompt: str,
-        keyframe_path: Path,
+        keyframe_path: Path | None,
         next_keyframe_path: Path | None = None,
     ) -> Path:
+        # keyframe_path is None for veo_mode="direct" scenes → Veo text-to-video.
         dest = self._video_dir / f"scene_{scene.scene_id}_veo.mp4"
         if dest.exists():
             log.info("  [visual/veo3] scene %d cached", scene.scene_id)
@@ -667,7 +675,7 @@ class AssetFactory:
         self,
         scene: SceneScript,
         prompt: str,
-        keyframe_path: Path,
+        keyframe_path: Path | None,
         clip_idx: int,
         next_keyframe_path: Path | None = None,
     ) -> Path:
@@ -675,7 +683,11 @@ class AssetFactory:
         if dest.exists():
             return dest
 
-        start_image = types.Image(image_bytes=keyframe_path.read_bytes(), mime_type="image/png")
+        # keyframe_path None → text-to-video (direct mode); else image-to-video.
+        start_image = (
+            types.Image(image_bytes=keyframe_path.read_bytes(), mime_type="image/png")
+            if keyframe_path else None
+        )
 
         # last_frame (first+last-frame interpolation) gives perfect scene-to-scene
         # handoff, BUT it is Veo's slow/expensive path (10x+ render time). It is
@@ -712,23 +724,28 @@ class AssetFactory:
             last_frame=last_frame,  # None unless VEO_LAST_FRAME enabled
         )
 
-        # Lead the Veo prompt with the render medium so the animation preserves the
-        # keyframe's style instead of regressing toward generic photoreal video.
+        # Lead the Veo prompt with the render medium so the style holds.
         medium_prefix = f"{medium}. " if medium else ""
-        veo_prompt = (
-            f"{medium_prefix}Smooth camera movement animating this scene while keeping "
-            f"the exact visual style of the source image. "
-            f"Add subtle environmental motion (particles, haze, gentle drift). "
-            + prompt
-        )
+        if start_image is not None:
+            # image-to-video: animate the keyframe, preserve its exact style
+            veo_prompt = (
+                f"{medium_prefix}Smooth camera movement animating this scene while keeping "
+                f"the exact visual style of the source image. "
+                f"Add subtle environmental motion (particles, haze, gentle drift). "
+                + prompt
+            )
+        else:
+            # direct text-to-video: no source frame — describe the living moment directly
+            veo_prompt = (
+                f"{medium_prefix}Cinematic footage with natural, dynamic motion true to the moment. "
+                + prompt
+            )
 
         t_submit = time.time()
-        operation = self._client.models.generate_videos(
-            model=settings.VEO_MODEL,
-            prompt=veo_prompt,
-            image=start_image,
-            config=veo_config,
-        )
+        gen_kwargs = {"model": settings.VEO_MODEL, "prompt": veo_prompt, "config": veo_config}
+        if start_image is not None:
+            gen_kwargs["image"] = start_image   # omit entirely for text-to-video
+        operation = self._client.models.generate_videos(**gen_kwargs)
 
         # Poll up to ~10 min, logging progress at INFO so a slow job is visible.
         max_polls = 120

@@ -170,6 +170,18 @@ For each scene, you MUST choose the most appropriate `engine_type` based on the 
 1. "veo_cinematic" (DEFAULT): Use this for dramatic, historical, atmospheric, or photorealistic scenes.
 2. "code_animator": Use this ONLY when explaining a complex concept, showing a map, charting data, or presenting a humorous/abstract idea where a 2D whiteboard stick-figure animation is better.
 
+═══ VEO MODE — keyframe vs direct (per scene) ═══
+For every "veo_cinematic" scene, also choose `veo_mode`:
+- "direct": pick this for scenes whose ESSENCE IS MOTION / ACTION / a dynamic event that
+  must be captured as living footage — an eruption, a sprint, water flowing, a dramatic
+  reveal, particles colliding, a process unfolding. Here the video is generated directly
+  from text for the most faithful, contextual motion (no static frame holding it back).
+- "keyframe" (DEFAULT): pick this for composition-led, character-focused, precise-layout,
+  or calm/static shots, and ANY scene with a recurring character (keeps the look consistent).
+RULE: Most scenes are "keyframe". Mark only the few genuine motion/action HERO scenes as
+"direct". Never mark a scene with a recurring character as "direct" (it breaks consistency).
+For "code_animator" scenes, set veo_mode to "keyframe" (it is ignored there).
+
 ═══ METADATA RULES ═══
   - visual_style_brief: One sentence (20-30 words) describing the overall cinematic
     DNA of this video — the unifying visual language across all scenes. Reference
@@ -230,9 +242,10 @@ _RESPONSE_SCHEMA = {
                     "image_prompt": {"type": "string"},
                     "video_prompt": {"type": "string"},
                     "engine_type": {"type": "string", "enum": ["veo_cinematic", "code_animator"]},
+                    "veo_mode": {"type": "string", "enum": ["keyframe", "direct"]},
                     "overlay_text": {"type": "string"},
                 },
-                "required": ["scene_id", "narration", "image_prompt", "video_prompt", "engine_type", "overlay_text"],
+                "required": ["scene_id", "narration", "image_prompt", "video_prompt", "engine_type", "veo_mode", "overlay_text"],
             },
         },
     },
