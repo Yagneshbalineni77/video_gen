@@ -280,8 +280,21 @@ def mix_bgm(video_path: Path, bgm_path: Path, dest: Path, bgm_db: float = -18.0)
 
 # ── subtitles ─────────────────────────────────────────────────────────────────
 
-def burn_subtitles(video_path: Path, subtitle_path: Path, dest: Path) -> None:
-    """Burn ASS/SRT subtitles into the video (center-screen, bold white text).
+def _font_file() -> str | None:
+    """First available bold sans font file (works on Debian Docker + dev hosts)."""
+    for p in (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",  # Docker image
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",          # most dev hosts
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    ):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def burn_subtitles(video_path: Path, subtitle_path: Path, dest: Path, watermark: str | None = None) -> None:
+    """Burn ASS/SRT subtitles into the video, and optionally a brand watermark
+    in the top-right corner.
 
     Uses a relative sub path + cwd to avoid Windows drive-letter colon being
     misread as an FFmpeg filter option separator (e.g. ass='C:/...' → error).
@@ -298,6 +311,17 @@ def burn_subtitles(video_path: Path, subtitle_path: Path, dest: Path) -> None:
             "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
             "Outline=3,Shadow=1,Alignment=2'"
         )
+
+    if watermark and watermark.strip():
+        ff = _font_file()
+        wm_text = watermark.strip().replace("\\", "").replace(":", r"\:").replace("'", "")
+        font_opt = f"fontfile='{ff}':" if ff else ""
+        # subtle, semi-transparent, top-right — clear of the bottom subtitles
+        vf += (
+            f",drawtext={font_opt}text='{wm_text}':fontsize=40:fontcolor=white@0.55:"
+            "shadowcolor=black@0.5:shadowx=2:shadowy=2:x=w-tw-48:y=46"
+        )
+
     run_ffmpeg(
         [
             "-i", str(video_path.resolve()),

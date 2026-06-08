@@ -67,6 +67,9 @@ YT_PRIVACY_STATUS: str = os.getenv("YT_PRIVACY_STATUS", "public")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
 
+# Brand watermark burned into the top-right of every video. Set WATERMARK_TEXT="" to disable.
+WATERMARK_TEXT: str = os.getenv("WATERMARK_TEXT", "Dextora")
+
 # ── Visual Style ──────────────────────────────────────────────────────────
 VISUAL_STYLE: str = os.getenv("VISUAL_STYLE", "cinematic_portrait")
 

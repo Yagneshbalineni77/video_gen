@@ -100,10 +100,10 @@ class VideoEditor:
                      for s in bundle.script.scenes]
             subtitles_from_scenes(items, sub_path, font=profile.get("sub_font", "Arial"))
 
-        # Step 8: burn subtitles → final render
+        # Step 8: burn subtitles (+ brand watermark) → final render
         final = self._render_dir / "final_render.mp4"
-        burn_subtitles(pre_sub, sub_path, final)
-        log.info("  [edit] subtitles burned")
+        burn_subtitles(pre_sub, sub_path, final, watermark=settings.WATERMARK_TEXT)
+        log.info("  [edit] subtitles + watermark burned")
 
         duration = probe_duration(final)
         log.info("Phase 4 done - %.1fs -> %s", duration, final.name)

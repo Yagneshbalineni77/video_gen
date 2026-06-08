@@ -130,29 +130,25 @@ def _ts(seconds: float) -> str:
 
 def _render_ass(chunks: list[CaptionChunk], landscape: bool = True, font: str = "Arial") -> str:
     """
-    Clean educational subtitle style:
-    - Bold white text, large and legible
-    - Semi-transparent dark pill background for contrast on any scene
-    - Bottom-center position with generous margin
-    - Outline + shadow so text reads on both bright and dark frames
+    Modern caption style (CapCut/Reels-grade):
+    - Big bold white text, heavy black outline + soft drop shadow (no dated box)
+    - Snappy pop-in animation per caption (fade + scale bounce)
+    - Lower-third, readable on any background
     """
     if landscape:
         res_x, res_y = 1920, 1080
-        font_size = 58
-        margin_v = 90
+        font_size = 68
+        margin_v = 110
     else:
         res_x, res_y = 1080, 1920
-        font_size = 64
-        margin_v = 220
+        font_size = 74
+        margin_v = 260
 
-    # Colours in ASS &HAABBGGRR format:
-    #   Primary  = opaque white    (&H00FFFFFF)
-    #   Outline  = near-black      (&H00111111)
-    #   Back     = 65% opaque dark (&HA6000000) — pill background
-    #   Shadow   = pure black      (&H00000000)
-    # Latin scripts get a touch of letter-spacing for that clean look; complex
-    # scripts (Devanagari) need 0 so conjunct ligatures aren't broken apart.
-    spacing = 0 if "Devanagari" in font else 1.2
+    # ASS colours are &HAABBGGRR.
+    #   Primary = white, Outline = near-black (heavy), Back = soft black shadow.
+    # BorderStyle 1 = outline+shadow (clean modern look, no opaque box).
+    # Devanagari needs 0 letter-spacing so conjuncts don't break.
+    spacing = 0 if "Devanagari" in font else 0.6
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -163,18 +159,17 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{font_size},&H00FFFFFF,&H00FFFFFF,&H00111111,&HA6000000,-1,0,0,0,100,100,{spacing},0,4,3,1,2,30,30,{margin_v},1
+Style: Default,{font},{font_size},&H00FFFFFF,&H00FFFFFF,&H00141414,&H99000000,-1,0,0,0,100,100,{spacing},0,1,5,3,2,60,60,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+    # Per-caption: fade in + a quick scale "pop" (112% → 100%) for a snappy modern feel.
+    POP = r"{\fad(60,40)\t(0,90,\fscx112\fscy112)\t(90,180,\fscx100\fscy100)\blur0}"
     lines: list[str] = []
     for chunk in chunks:
-        # Scale text to 110% on display for the pop-in effect (no animation tag needed,
-        # but we use \blur0 to ensure crisp rendering on re-encode)
-        text = r"{\blur0}" + chunk.text()
         lines.append(
-            f"Dialogue: 0,{_ts(chunk.start)},{_ts(chunk.end)},Default,,0,0,0,,{text}"
+            f"Dialogue: 0,{_ts(chunk.start)},{_ts(chunk.end)},Default,,0,0,0,,{POP}{chunk.text()}"
         )
 
     return header + "\n".join(lines) + "\n"
