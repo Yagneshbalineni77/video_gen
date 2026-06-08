@@ -11,3 +11,6 @@ dist/
 build/
 assets/bgm/
 config/brand_guidelines.pdf
+
+# Claude Code local settings
+.claude/
