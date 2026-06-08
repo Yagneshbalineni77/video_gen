@@ -39,6 +39,16 @@ docker run -p 8000:8000 \
 | `GEMINI_API_KEY` | — (**required**) | Gemini key for script, TTS, Imagen, Veo |
 | `MAX_CONCURRENT_JOBS` | `10` | Videos rendered in parallel; the rest queue. Total concurrent Veo calls ≈ this × 2 (auto-tuned). |
 | `TARGET_TOTAL_VEO` | `20` | Target total concurrent Veo/Imagen calls used to derive per-job concurrency. |
+| `SIGNUP_INVITE_CODE` | `dextora-invite` | Shared code required to register. Change it; share with your team. |
+| `ADMIN_EMAILS` | — | Comma-separated emails granted admin (see all jobs) on signup. |
+| `JWT_SECRET` | auto | Login token signing key; auto-generated + persisted if unset. |
+| `WATERMARK_TEXT` | `Dextora` | Brand watermark burned top-right; `""` disables. |
+
+## Accounts / login
+The web UI requires login. Users **sign up with the shared `SIGNUP_INVITE_CODE`**
+(email + password), then log in — JWT sessions, bcrypt-hashed passwords, stored in
+a SQLite file under `output/` (persists with the mounted volume). Each user sees only
+their own jobs; `ADMIN_EMAILS` accounts see all. No per-user generation cap.
 
 Raising `MAX_CONCURRENT_JOBS` much past 10 on a standard AI-Studio key will hit
 API rate limits (the pipeline degrades gracefully, but throughput drops). For a

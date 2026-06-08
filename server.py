@@ -28,10 +28,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+import auth
 
 ROOT = Path(__file__).parent
 RUNS = ROOT / "output" / "runs"
@@ -60,6 +63,56 @@ LANGUAGES = [
 VALID_LANG_KEYS = {l["key"] for l in LANGUAGES}
 
 app = FastAPI(title="Faceless Video Studio")
+auth.init_db()
+
+# ── authentication ───────────────────────────────────────────────────────────
+_bearer = HTTPBearer(auto_error=True)
+
+
+def current_user(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
+    """Resolve the logged-in user from the Bearer JWT, or 401."""
+    payload = auth.decode_token(creds.credentials)
+    if not payload:
+        raise HTTPException(401, "invalid or expired token")
+    user = auth.get_user_by_id(payload.get("sub"))
+    if not user:
+        raise HTTPException(401, "user no longer exists")
+    return user
+
+
+class RegisterReq(BaseModel):
+    email: str
+    password: str
+    invite_code: str
+
+
+class LoginReq(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/auth/register")
+def register(req: RegisterReq) -> JSONResponse:
+    if req.invite_code.strip() != auth.INVITE_CODE:
+        raise HTTPException(403, "invalid invite code")
+    try:
+        user = auth.create_user(req.email, req.password)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return JSONResponse({"token": auth.make_token(user), "user": {"email": user["email"], "role": user["role"]}})
+
+
+@app.post("/api/auth/login")
+def login(req: LoginReq) -> JSONResponse:
+    user = auth.authenticate(req.email, req.password)
+    if not user:
+        raise HTTPException(401, "wrong email or password")
+    return JSONResponse({"token": auth.make_token(user), "user": {"email": user["email"], "role": user["role"]}})
+
+
+@app.get("/api/auth/me")
+def me(user: dict = Depends(current_user)) -> JSONResponse:
+    return JSONResponse({"email": user["email"], "role": user["role"]})
 
 # ── concurrency tuning ───────────────────────────────────────────────────────
 # MAX_CONCURRENT caps how many pipelines run at once. Default 10 — the validated
@@ -85,7 +138,7 @@ _pending: "_queuemod.Queue[str]" = _queuemod.Queue()
 
 # Persisted registry so a server restart doesn't lose job history / in-flight state.
 _STATE_FILE = RUNS / "_jobs.json"
-_PERSIST_KEYS = ("id", "status", "prompt", "style", "lang", "created", "run_dir", "video", "error")
+_PERSIST_KEYS = ("id", "status", "prompt", "style", "lang", "created", "run_dir", "video", "error", "user")
 
 
 def _save_jobs() -> None:
@@ -292,11 +345,16 @@ def stats() -> JSONResponse:
     })
 
 
+def _can_see(job: dict, user: dict) -> bool:
+    return user["role"] == "admin" or job.get("user") == user["email"]
+
+
 @app.get("/api/jobs")
-def jobs_list(limit: int = 30) -> JSONResponse:
-    """Recent jobs (newest first) so the UI can repopulate after reload/restart."""
+def jobs_list(limit: int = 30, user: dict = Depends(current_user)) -> JSONResponse:
+    """The caller's own recent jobs (admins see everyone's) so the UI repopulates."""
     with _lock:
-        recent = [_jobs[jid] for jid in reversed(_order) if jid in _jobs][:limit]
+        recent = [_jobs[jid] for jid in reversed(_order)
+                  if jid in _jobs and _can_see(_jobs[jid], user)][:limit]
         out = [{"id": j["id"], "prompt": j["prompt"], "style": j["style"],
                 "lang": j.get("lang"), "status": j["status"],
                 "has_video": bool(j.get("video"))} for j in recent]
@@ -304,7 +362,7 @@ def jobs_list(limit: int = 30) -> JSONResponse:
 
 
 @app.post("/api/generate")
-def generate(req: GenerateReq) -> JSONResponse:
+def generate(req: GenerateReq, user: dict = Depends(current_user)) -> JSONResponse:
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(400, "prompt is required")
@@ -319,6 +377,7 @@ def generate(req: GenerateReq) -> JSONResponse:
             "id": job_id, "status": "queued", "prompt": prompt, "style": req.style, "lang": req.lang,
             "created": datetime.now(timezone.utc).isoformat(),
             "run_dir": "", "video": None, "error": None, "pid": None,
+            "user": user["email"],
         }
         _order.append(job_id)
     _save_jobs()
@@ -327,10 +386,12 @@ def generate(req: GenerateReq) -> JSONResponse:
 
 
 @app.get("/api/jobs/{job_id}")
-def job_status(job_id: str) -> JSONResponse:
+def job_status(job_id: str, user: dict = Depends(current_user)) -> JSONResponse:
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")
+    if not _can_see(job, user):
+        raise HTTPException(403, "not your job")
     out = {k: job[k] for k in ("id", "status", "prompt", "style", "error")}
     out["has_video"] = bool(job.get("video"))
     if job["status"] == "queued":
@@ -345,19 +406,35 @@ def job_status(job_id: str) -> JSONResponse:
     return JSONResponse(out)
 
 
+def _user_from_query_token(token: str) -> dict:
+    """Auth for media URLs: <video src> / download links can't send an Authorization
+    header, so the token rides as a ?token= query param instead."""
+    payload = auth.decode_token(token or "")
+    u = auth.get_user_by_id(payload.get("sub")) if payload else None
+    if not u:
+        raise HTTPException(401, "invalid or expired token")
+    return u
+
+
 @app.get("/api/jobs/{job_id}/video")
-def job_video(job_id: str) -> FileResponse:
+def job_video(job_id: str, token: str = "") -> FileResponse:
+    user = _user_from_query_token(token)
     job = _jobs.get(job_id)
     if not job or not job.get("video"):
         raise HTTPException(404, "video not ready")
+    if not _can_see(job, user):
+        raise HTTPException(403, "not your job")
     return FileResponse(job["video"], media_type="video/mp4")
 
 
 @app.get("/api/jobs/{job_id}/download")
-def job_download(job_id: str) -> FileResponse:
+def job_download(job_id: str, token: str = "") -> FileResponse:
+    user = _user_from_query_token(token)
     job = _jobs.get(job_id)
     if not job or not job.get("video"):
         raise HTTPException(404, "video not ready")
+    if not _can_see(job, user):
+        raise HTTPException(403, "not your job")
     name = f"{_slug(job['prompt'])}_{job['style']}.mp4"
     return FileResponse(job["video"], media_type="video/mp4", filename=name)
 

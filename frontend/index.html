@@ -41,6 +41,9 @@
   textarea{width:100%;resize:vertical;background:rgba(10,10,18,.7);border:1px solid var(--border);border-radius:14px;color:var(--text);font-family:inherit;font-size:15px;line-height:1.55;padding:15px 17px;outline:none;transition:.2s}
   textarea::placeholder{color:var(--faint)}
   textarea:focus{border-color:rgba(124,92,255,.6);box-shadow:0 0 0 4px rgba(124,92,255,.12)}
+  .authin{width:100%;background:rgba(10,10,18,.7);border:1px solid var(--border);border-radius:12px;color:var(--text);font-family:inherit;font-size:15px;padding:13px 15px;outline:none;transition:.2s}
+  .authin:focus{border-color:rgba(124,92,255,.6);box-shadow:0 0 0 4px rgba(124,92,255,.12)}
+  .authin::placeholder{color:var(--faint)}
 
   .styles{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:6px}
   .style{position:relative;cursor:pointer;border:1px solid var(--border);background:rgba(12,12,22,.55);border-radius:13px;padding:14px;transition:.15s}
@@ -119,13 +122,28 @@ const { useState, useEffect, useRef, useCallback } = React;
 const createRoot = ReactDOM.createRoot;
 const html = htm.bind(React.createElement);
 
+// ── auth token (persisted) ──────────────────────────────────────────────────
+let TOKEN = localStorage.getItem('studio_token') || '';
+const setToken = (t) => { TOKEN = t || ''; t ? localStorage.setItem('studio_token', t) : localStorage.removeItem('studio_token'); };
+const _hdr = (extra={}) => TOKEN ? { ...extra, Authorization: 'Bearer ' + TOKEN } : extra;
+async function _json(r) {
+  if (r.status === 401) { setToken(''); location.reload(); throw new Error('session expired'); }
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || 'request failed');
+  return r.json();
+}
 const api = {
   styles: () => fetch('/api/styles').then(r => r.json()),
   langs:  () => fetch('/api/languages').then(r => r.json()),
-  stats:  () => fetch('/api/stats').then(r => r.json()),
-  jobs:   () => fetch('/api/jobs').then(r => r.json()),
-  gen:    (prompt, style, lang) => fetch('/api/generate', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({prompt, style, lang}) }).then(async r => { if(!r.ok) throw new Error((await r.json()).detail||'failed'); return r.json(); }),
-  job:    (id) => fetch('/api/jobs/'+id).then(r => r.json()),
+  stats:  () => fetch('/api/stats', { headers: _hdr() }).then(r => r.json()),
+  jobs:   () => fetch('/api/jobs', { headers: _hdr() }).then(_json),
+  gen:    (prompt, style, lang) => fetch('/api/generate', { method:'POST', headers:_hdr({'Content-Type':'application/json'}), body:JSON.stringify({prompt, style, lang}) }).then(_json),
+  job:    (id) => fetch('/api/jobs/'+id, { headers: _hdr() }).then(_json),
+  // media URLs carry the token as a query param (<video>/<a> can't send headers)
+  videoUrl: (id) => '/api/jobs/'+id+'/video?token=' + encodeURIComponent(TOKEN),
+  downloadUrl: (id) => '/api/jobs/'+id+'/download?token=' + encodeURIComponent(TOKEN),
+  me:       () => fetch('/api/auth/me', { headers: _hdr() }).then(_json),
+  login:    (email, password) => fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, password}) }).then(_json),
+  register: (email, password, invite_code) => fetch('/api/auth/register', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, password, invite_code}) }).then(_json),
 };
 
 function LangPicker({ langs, value, onChange }) {
@@ -195,8 +213,8 @@ function Single({ styles, langs }) {
     </div></div>`;
   if(view==='done') return html`<div>
     <div class="hero"><h2>✨ Your video is ready</h2><p>${prompt}</p></div>
-    <div class="card"><video src=${'/api/jobs/'+job+'/video'} controls autoplay playsinline></video>
-      <div class="row"><a class="btn-2 btn-dl" href=${'/api/jobs/'+job+'/download'}>⬇ Download MP4</a>
+    <div class="card"><video src=${api.videoUrl(job)} controls autoplay playsinline></video>
+      <div class="row"><a class="btn-2 btn-dl" href=${api.downloadUrl(job)}>⬇ Download MP4</a>
         <div class="btn-2 btn-again" onClick=${reset}>↻ Generate another</div></div></div></div>`;
   return html`<div><div class="hero"><h2>Something went wrong</h2></div>
     <div class="card"><div class="errbox">${err}</div>
@@ -219,8 +237,8 @@ function JobCard({ id, prompt, style }) {
   return html`<div class="jcard">
     ${badge}<div class="jp">${prompt}</div>
     ${s.status==='done'?html`
-      <video src=${'/api/jobs/'+id+'/video'} controls playsinline></video>
-      <a class="mini-dl" href=${'/api/jobs/'+id+'/download'}>⬇ Download</a>`
+      <video src=${api.videoUrl(id)} controls playsinline></video>
+      <a class="mini-dl" href=${api.downloadUrl(id)}>⬇ Download</a>`
     : (s.status==='error'||s.status==='interrupted')?html`<div class="jstat"><span class="jerr">✗ ${s.error||s.status}</span></div>`
     : html`<div class="jstat"><span>${s.phase||s.status}</span><span class="pct">${s.percent||0}%</span></div>
            <div class="bar"><div style=${{width:(s.percent||0)+'%'}}></div></div>`}
@@ -303,8 +321,45 @@ function Batch({ styles, langs }) {
   </div>`;
 }
 
-/* ───────────────── app shell ───────────────── */
-function App() {
+/* ───────────────── auth screen ───────────────── */
+function Auth({ onAuth }) {
+  const [mode,setMode]=useState('login');   // 'login' | 'signup'
+  const [email,setEmail]=useState(''); const [pw,setPw]=useState(''); const [code,setCode]=useState('');
+  const [err,setErr]=useState(''); const [busy,setBusy]=useState(false);
+  const submit=async()=>{
+    setErr(''); setBusy(true);
+    try{
+      const res = mode==='login' ? await api.login(email.trim(), pw)
+                                 : await api.register(email.trim(), pw, code.trim());
+      setToken(res.token); onAuth(res.user);
+    }catch(e){ setErr(e.message); } finally{ setBusy(false); }
+  };
+  return html`<div class="wrap" style=${{maxWidth:'440px'}}>
+    <div class="brand" style=${{justifyContent:'center',marginTop:'40px'}}>
+      <div class="logo">🎬</div><div><h1>Faceless Video Studio</h1>
+      <div class="tag">Sign in to generate</div></div></div>
+    <div class="card" style=${{marginTop:'26px'}}>
+      <div class="tabs" style=${{width:'100%',margin:'0 0 20px'}}>
+        <button class=${'tab'+(mode==='login'?' on':'')} style=${{flex:1}} onClick=${()=>{setMode('login');setErr('')}}>Log in</button>
+        <button class=${'tab'+(mode==='signup'?' on':'')} style=${{flex:1}} onClick=${()=>{setMode('signup');setErr('')}}>Sign up</button>
+      </div>
+      <div class="label">Email</div>
+      <input class="authin" type="email" value=${email} onInput=${e=>setEmail(e.target.value)} placeholder="you@dextora.ai"/>
+      <div class="label" style=${{marginTop:'14px'}}>Password</div>
+      <input class="authin" type="password" value=${pw} onInput=${e=>setPw(e.target.value)} placeholder="••••••••"
+        onKeyDown=${e=>e.key==='Enter'&&mode==='login'&&submit()}/>
+      ${mode==='signup'?html`
+        <div class="label" style=${{marginTop:'14px'}}>Invite code</div>
+        <input class="authin" value=${code} onInput=${e=>setCode(e.target.value)} placeholder="team invite code"/>`:null}
+      ${err?html`<div class="errbox" style=${{marginTop:'16px'}}>${err}</div>`:null}
+      <button class="gen" disabled=${busy||!email||!pw||(mode==='signup'&&!code)} onClick=${submit}>
+        ${busy?'…':(mode==='login'?'Log in':'Create account')}</button>
+    </div>
+  </div>`;
+}
+
+/* ───────────────── studio (authed) ───────────────── */
+function Studio({ user, onLogout }) {
   const [styles,setStyles]=useState([]); const [langs,setLangs]=useState([]); const [mode,setMode]=useState('single');
   useEffect(()=>{
     api.styles().then(setStyles).catch(()=>{});
@@ -312,8 +367,14 @@ function App() {
   },[]);
   const ready = styles.length && langs.length;
   return html`<div class="wrap">
-    <div class="brand"><div class="logo">🎬</div><div>
-      <h1>Faceless Video Studio</h1><div class="tag">AI cinematic video · Gemini · Imagen 4 · Veo 3</div></div></div>
+    <div style=${{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <div class="brand"><div class="logo">🎬</div><div>
+        <h1>Faceless Video Studio</h1><div class="tag">AI cinematic video · Gemini · Imagen 4 · Veo 3</div></div></div>
+      <div style=${{textAlign:'right',fontSize:'12.5px',color:'var(--muted)'}}>
+        ${user.email}${user.role==='admin'?' · admin':''}<br/>
+        <span style=${{color:'var(--accent3)',cursor:'pointer'}} onClick=${onLogout}>Log out</span>
+      </div>
+    </div>
     <div class="tabs">
       <button class=${'tab'+(mode==='single'?' on':'')} onClick=${()=>setMode('single')}>Single</button>
       <button class=${'tab'+(mode==='batch'?' on':'')} onClick=${()=>setMode('batch')}>Batch · 10 at a time</button>
@@ -321,6 +382,20 @@ function App() {
     ${ready? (mode==='single'?html`<${Single} styles=${styles} langs=${langs}/>`:html`<${Batch} styles=${styles} langs=${langs}/>`)
       : html`<div class="card">Loading…</div>`}
   </div>`;
+}
+
+/* ───────────────── app shell (auth gate) ───────────────── */
+function App() {
+  const [user,setUser]=useState(null);
+  const [checking,setChecking]=useState(!!TOKEN);
+  useEffect(()=>{
+    if(!TOKEN){ setChecking(false); return; }
+    api.me().then(setUser).catch(()=>{ setToken(''); }).finally(()=>setChecking(false));
+  },[]);
+  const logout=()=>{ setToken(''); setUser(null); };
+  if(checking) return html`<div class="wrap"><div class="card" style=${{marginTop:'60px',textAlign:'center'}}>Loading…</div></div>`;
+  if(!user) return html`<${Auth} onAuth=${setUser}/>`;
+  return html`<${Studio} user=${user} onLogout=${logout}/>`;
 }
 createRoot(document.getElementById('root')).render(html`<${App}/>`);
 </script>
