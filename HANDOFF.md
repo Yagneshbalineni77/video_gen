@@ -45,13 +45,14 @@ The old sandbox had only **8 cores**, so 10 simultaneous assemblies thrashed (lo
 **On the 32-core box this disappears.** Rule: `MAX_CONCURRENT_JOBS ≈ cores ÷ 2`.
 
 ## OPEN / NEXT (where we stopped)
-1. **PUSH this commit** to GitHub (was blocked on auth on the old sandbox).
-2. **Formula-overlay (recommended next):** Imagen Ultra makes in-frame text reliable,
-   but Veo animation can still drift text during motion. For *guaranteed* correct
-   formulas (F=ma, CO₂), overlay them as clean graphics on top of the video (like
-   subtitles, pixel-perfect, model-independent). NOT built yet — discussed, user interested.
+1. DONE — pushed to GitHub (Yagneshbalineni77/video_gen, branch video_gen).
+2. DONE — **Formula-overlay**: Phase 2 emits `overlay_text` per scene; Phase 4
+   burns it as a pixel-perfect graphic (`_render_overlay` + `overlay_image_on_video`).
+   Formulas (F=ma, CO₂) are now model-independent and always correct.
 3. Optional: assembly-slot throttle so Phase 4 auto-limits to cores regardless of MAX_CONCURRENT_JOBS.
 4. Optional: Vertex AI provisioned quota for true >10× (AI-Studio key caps Imagen RPM).
+5. TODO (user): mirror to dextoraai-dev/dextora_micro_services branch video_gen_V2
+   (run locally — sandbox safety guard blocks pushing to a different org).
 
 ## Gotchas
 - Secrets (`.env`, `credentials/`) are gitignored — never commit them; set via env on each host.
