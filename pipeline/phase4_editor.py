@@ -91,19 +91,46 @@ class VideoEditor:
         # build from the KNOWN script text (ASR is wrong-script/unreliable there).
         sub_path = self._tmp / "subtitles.ass"
         profile = settings.narration_profile()
-        if profile.get("use_asr", True):
-            transcribe_to_ass(narration_wav, sub_path, language=profile["whisper_lang"])
-        else:
-            from utils.whisper_captions import subtitles_from_scenes
-            dur_map = {a.scene_id: a.duration_ms for a in bundle.audio_assets}
-            items = [(s.narration, dur_map.get(s.scene_id, s.duration_ms or 4000))
-                     for s in bundle.script.scenes]
-            subtitles_from_scenes(items, sub_path, font=profile.get("sub_font", "Arial"))
+        subs_ready = False
+        try:
+            if profile.get("use_asr", True):
+                transcribe_to_ass(narration_wav, sub_path, language=profile["whisper_lang"])
+            else:
+                from utils.whisper_captions import subtitles_from_scenes
+                dur_map = {a.scene_id: a.duration_ms for a in bundle.audio_assets}
+                items = [(s.narration, dur_map.get(s.scene_id, s.duration_ms or 4000))
+                         for s in bundle.script.scenes]
+                subtitles_from_scenes(items, sub_path, font=profile.get("sub_font", "Arial"))
+            subs_ready = sub_path.exists()
+        except Exception as exc:
+            log.warning("  [edit] subtitle generation failed (%s) — rendering without subtitles", exc)
 
-        # Step 8: burn subtitles (+ brand watermark) → final render
+        # Step 8: burn subtitles (+ brand watermark) → final render. Neither a subtitle
+        # failure nor a burn failure may lose the finished video.
+        burned = self._tmp / "burned.mp4"
+        try:
+            burn_subtitles(pre_sub, sub_path if subs_ready else None, burned,
+                           watermark=settings.WATERMARK_TEXT)
+            log.info("  [edit] %s burned",
+                     "subtitles + watermark" if subs_ready else "watermark (subtitles skipped)")
+        except Exception as exc:
+            log.warning("  [edit] burn step failed (%s) — saving un-burned video so the render still completes", exc)
+            import shutil
+            shutil.copy2(pre_sub, burned)
+
+        # Step 9: hard-trim final output to exact narration audio length.
+        # This eliminates any video overrun that BGM mixing or xfade padding can introduce
+        # (e.g. a 13-min video with audio content at only 4:33 gets trimmed to 4:33).
         final = self._render_dir / "final_render.mp4"
-        burn_subtitles(pre_sub, sub_path, final, watermark=settings.WATERMARK_TEXT)
-        log.info("  [edit] subtitles + watermark burned")
+        narration_dur_s = probe_duration(narration_wav)
+        burned_dur_s = probe_duration(burned)
+        if burned_dur_s > narration_dur_s + 1.0:
+            log.info("  [edit] trimming final from %.1fs to narration length %.1fs",
+                     burned_dur_s, narration_dur_s)
+            trim_video_to_duration(burned, int(narration_dur_s * 1000), final)
+        else:
+            import shutil
+            shutil.move(str(burned), str(final))
 
         duration = probe_duration(final)
         log.info("Phase 4 done - %.1fs -> %s", duration, final.name)
@@ -121,39 +148,88 @@ class VideoEditor:
 
         for i, scene in enumerate(scenes):
             sid = scene.scene_id
-            audio = audio_map[sid]
-            visual = visual_map[sid]
+            audio = audio_map.get(sid)
+            visual = visual_map.get(sid)
 
             # Pad every clip except the last by the fade overlap so the xfade does
             # not consume narration-aligned time (keeps A/V in sync — see run()).
             is_last = (i == len(scenes) - 1)
-            target_ms = audio.duration_ms + (0 if is_last else fade_ms)
+            dur_ms = audio.duration_ms if audio else (scene.duration_ms or 4000)
+            target_ms = dur_ms + (0 if is_last else fade_ms)
 
-            # Raw source → silent normalised MP4
+            # Raw source → silent normalised MP4. ANY failure here (corrupt clip,
+            # missing asset, ffmpeg error) drops to an emergency text card so a single
+            # bad scene can never crash the whole render.
             raw_norm = self._tmp / f"scene_{sid}_norm.mp4"
             trimmed = self._tmp / f"scene_{sid}_clip.mp4"
-
-            if visual.raw_video_path and visual.raw_video_path.exists():
-                normalize_clip(visual.raw_video_path, raw_norm)
-                trim_video_to_duration(raw_norm, target_ms, trimmed)
-            elif visual.keyframe_image_path and visual.keyframe_image_path.exists():
-                image_to_video(visual.keyframe_image_path, target_ms, trimmed)
-            else:
-                raise FileNotFoundError(f"No visual asset for scene {sid}")
+            try:
+                if visual and visual.raw_video_path and visual.raw_video_path.exists():
+                    normalize_clip(visual.raw_video_path, raw_norm)
+                    trim_video_to_duration(raw_norm, target_ms, trimmed)
+                elif visual and visual.keyframe_image_path and visual.keyframe_image_path.exists():
+                    image_to_video(visual.keyframe_image_path, target_ms, trimmed)
+                else:
+                    raise FileNotFoundError(f"no visual asset for scene {sid}")
+            except Exception as exc:
+                log.warning("  [edit] scene %d clip prep failed (%s) — emergency text card", sid, exc)
+                trimmed = self._emergency_clip(scene, target_ms)
 
             # Pin a guaranteed-accurate formula/term graphic over this scene if the
             # script declared one (model-independent → never garbled like F=ma->f=a).
+            # An overlay failure must never drop the scene — skip it and keep the clip.
             if getattr(scene, "overlay_text", None):
-                ov_png = self._render_overlay(scene.overlay_text)
-                ov_clip = self._tmp / f"scene_{sid}_overlay.mp4"
-                overlay_image_on_video(trimmed, ov_png, ov_clip)
-                trimmed = ov_clip
-                log.info("  [edit] scene %d overlay: %s", sid, scene.overlay_text)
+                try:
+                    ov_png = self._render_overlay(scene.overlay_text)
+                    ov_clip = self._tmp / f"scene_{sid}_overlay.mp4"
+                    overlay_image_on_video(trimmed, ov_png, ov_clip)
+                    trimmed = ov_clip
+                    log.info("  [edit] scene %d overlay: %s", sid, scene.overlay_text)
+                except Exception as exc:
+                    log.warning("  [edit] scene %d overlay failed (%s) — skipping overlay", sid, exc)
 
             log.info("  [edit] scene %d prepared (%.2fs)", sid, target_ms / 1000)
             clips.append(trimmed)
 
         return clips
+
+    def _emergency_clip(self, scene, target_ms: int) -> Path:
+        """Last-resort scene visual: the narration rendered as a dark text card, turned
+        into a clip. Guarantees every scene yields a valid clip for the concat even if
+        its real visual is missing or ffmpeg choked on the source."""
+        from PIL import Image, ImageDraw
+
+        png = self._tmp / f"scene_{scene.scene_id}_emergency.png"
+        dest = self._tmp / f"scene_{scene.scene_id}_emergency.mp4"
+        try:
+            W, H = 1920, 1080
+            img = Image.new("RGB", (W, H), (10, 14, 28))
+            draw = ImageDraw.Draw(img)
+            font = self._overlay_font(58)
+            text = (getattr(scene, "narration", "") or "").strip()
+            words, lines, cur = text.split(), [], ""
+            for w in words:
+                trial = f"{cur} {w}".strip()
+                if draw.textlength(trial, font=font) <= W - 360:
+                    cur = trial
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+            if cur:
+                lines.append(cur)
+            lines = lines[:6] or [" "]
+            lh = int(font.size * 1.4)
+            y = (H - lh * len(lines)) // 2
+            for ln in lines:
+                x = (W - draw.textlength(ln, font=font)) // 2
+                draw.text((x, y), ln, font=font, fill=(235, 233, 245))
+                y += lh
+            img.save(str(png))
+        except Exception:
+            # even text rendering failed → plain solid frame, still a valid visual
+            Image.new("RGB", (1920, 1080), (10, 14, 28)).save(str(png))
+        image_to_video(png, target_ms, dest)
+        return dest
 
     @staticmethod
     def _overlay_font(size: int):

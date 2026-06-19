@@ -128,6 +128,25 @@ def _split_narration(sentences: list[str], weights: list[float]) -> list[str]:
     return [" ".join(g).strip() for g in groups]
 
 
+_WORDS_PER_SCENE = 40   # target ~16s of speech per scene at 150 wpm
+_MAX_SCENES = 20        # Veo concurrency cap
+
+
+def _ideal_scene_count(total_words: int, n_segments: int) -> int:
+    """Return a scene count that keeps each scene to ~_WORDS_PER_SCENE.
+
+    If visual_directions are present (n_segments>0) we use them as the
+    primary split but expand toward the word-count ideal when they'd create
+    scenes that are too long. Capped at _MAX_SCENES."""
+    word_based = max(3, (total_words + _WORDS_PER_SCENE - 1) // _WORDS_PER_SCENE)
+    if n_segments > 0:
+        # honour the content author's visual beats but allow expansion
+        n = max(n_segments, min(word_based, _MAX_SCENES))
+    else:
+        n = min(word_based, _MAX_SCENES)
+    return n
+
+
 def build_script_from_portal(item: dict, *, subject_name: str = "") -> VideoScript:
     """Convert a portal script item → VideoScript (verbatim narration, no Phase 2)."""
     title = (item.get("title") or "Untitled").strip()
@@ -137,19 +156,21 @@ def build_script_from_portal(item: dict, *, subject_name: str = "") -> VideoScri
     if not sentences:
         sentences = [title]
 
+    total_words = sum(len(s.split()) for s in sentences)
     segments = _parse_visual_segments(item.get("visual_directions") or "")
 
     if segments:
-        # cap scene count so very granular direction lists don't over-fragment, and
-        # never exceed the sentence count (avoids empty/silent scenes)
-        n = max(1, min(len(segments), len(sentences), 18))
+        n = _ideal_scene_count(total_words, len(segments))
+        # never create more scenes than sentences (avoids empty/silent scenes)
+        n = min(n, len(sentences))
         grouped = _group(segments, n)
         descs = [" ".join(d for _, _, d in g).strip() for g in grouped]
         weights = [max(1, sum((e - s) for s, e, _ in g)) for g in grouped]
         narration = _split_narration(sentences, weights)
     else:
-        # no visual directions → narration-only scenes (~2 sentences each, 3–14 scenes)
-        n = max(3, min(14, (len(sentences) + 1) // 2))
+        # no visual directions → scale by word count, target ~16s per scene
+        n = _ideal_scene_count(total_words, 0)
+        n = min(n, len(sentences))
         grouped_sents = _group(sentences, n)
         descs = [""] * n
         narration = [" ".join(g).strip() for g in grouped_sents]

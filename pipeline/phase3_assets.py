@@ -34,6 +34,27 @@ from schemas.models import AssetBundle, AudioAsset, CharacterRef, SceneScript, S
 
 log = logging.getLogger(__name__)
 
+# Camera angle variants cycled across multi-clip scenes so each 8-second
+# clip shows the same subject from a DIFFERENT angle — prevents visible footage loops.
+_CLIP_ANGLE_VARIANTS = [
+    "wide establishing shot, slow push-in",
+    "medium close-up, gentle orbit left",
+    "tight close-up macro detail, slow zoom out",
+    "low angle dramatic upshot, creeping dolly",
+    "high angle overhead bird's-eye, descending crane",
+    "side profile tracking shot, parallax movement",
+    "three-quarter angle, slow arc right",
+    "eye-level direct, subtle handheld drift",
+]
+
+
+def _vary_clip_prompt(base_prompt: str, clip_idx: int) -> str:
+    """Append a unique camera direction to each clip of a multi-clip scene.
+    This prevents Veo from generating visually identical footage when the same
+    subject needs multiple clips to cover a long narration window."""
+    angle = _CLIP_ANGLE_VARIANTS[clip_idx % len(_CLIP_ANGLE_VARIANTS)]
+    return f"{base_prompt}. Camera: {angle}."
+
 
 class VeoBlockedError(RuntimeError):
     """Veo completed but returned no video — a safety/RAI filter block.
@@ -755,8 +776,10 @@ class AssetFactory:
         for i in range(n_clips):
             # Only the final clip of the scene uses last_frame to bridge into next scene
             use_last_frame = (i == n_clips - 1)
+            # Vary camera perspective per clip so multi-clip scenes don't repeat footage.
+            clip_prompt = _vary_clip_prompt(enriched_prompt, i) if n_clips > 1 else enriched_prompt
             clip = self._fetch_veo_clip(
-                scene, enriched_prompt, keyframe_path, i,
+                scene, clip_prompt, keyframe_path, i,
                 next_keyframe_path if use_last_frame else None,
             )
             clips.append(clip)
