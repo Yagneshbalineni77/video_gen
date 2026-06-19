@@ -105,6 +105,14 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return any(t in s for t in ("429", "resource_exhausted", "rate limit", "quota", "exhausted"))
 
 
+def _is_spend_cap_error(exc: Exception) -> bool:
+    """A key whose project has hit its monthly SPEND CAP is dead for the rest of
+    this run — retrying or pacing it is futile (only a billing change in AI Studio
+    revives it). Detect it so we quarantine the key instead of burning calls on it."""
+    s = str(exc).lower()
+    return ("spend" in s and "cap" in s) or "spending cap" in s or "billing" in s
+
+
 class VeoBlockedError(RuntimeError):
     """Veo completed but returned no video — a safety/RAI filter block.
     Re-submitting the same prompt is pointless, so this is NOT retried."""
@@ -174,6 +182,7 @@ class AssetFactory:
         self._client = self._clients[0]          # primary (default / non-rotated)
         self._key_i = 0
         self._key_lock = threading.Lock()
+        self._dead_keys: set[int] = set()   # indices quarantined this run (spend cap)
         if len(self._clients) > 1:
             log.info("  [keys] API key pool active: %d keys (round-robin)", len(self._clients))
         # Shared pacer for TTS so parallel EN+HI threads don't burst past the
@@ -187,15 +196,33 @@ class AssetFactory:
         self._char_dir.mkdir(parents=True, exist_ok=True)
 
     def _next_client(self):
-        """Thread-safe round-robin over the key pool. One-shot calls (TTS, Imagen,
-        enrichment) rotate per call; a Veo clip grabs one client for its whole
-        generate→poll→download lifecycle (the operation handle is key-bound)."""
+        """Thread-safe round-robin over the LIVE key pool. One-shot calls (TTS,
+        Imagen, enrichment) rotate per call; a Veo clip grabs one client for its
+        whole generate→poll→download lifecycle (the operation handle is key-bound).
+
+        Keys quarantined this run (spend cap exceeded) are skipped — they cannot
+        recover without a billing change, so routing to them only wastes time and
+        causes silent-scene fallbacks."""
         if len(self._clients) == 1:
             return self._clients[0]
         with self._key_lock:
-            c = self._clients[self._key_i % len(self._clients)]
+            live = [i for i in range(len(self._clients)) if i not in self._dead_keys]
+            if not live:                       # all capped — let it error explicitly
+                live = list(range(len(self._clients)))
+            idx = live[self._key_i % len(live)]
             self._key_i += 1
-        return c
+            return self._clients[idx]
+
+    def _quarantine_client(self, client) -> None:
+        """Remove a spend-capped key from rotation for the rest of this run."""
+        with self._key_lock:
+            for i, c in enumerate(self._clients):
+                if c is client and i not in self._dead_keys:
+                    self._dead_keys.add(i)
+                    live = len(self._clients) - len(self._dead_keys)
+                    log.warning("  [keys] key[%d] QUARANTINED — monthly spend cap exceeded "
+                                "(fix at ai.studio/spend). %d live key(s) left", i, live)
+                    break
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -294,10 +321,12 @@ class AssetFactory:
             if profile.get("tts_directive"):
                 directive = f"{directive}, {profile['tts_directive']}"
             contents = f"{directive}:\n\n{text}"
-        # Pace below the shared quota; on 429 shrink the rate so the herd backs off.
+        # Pace below the quota; on a spend-cap 429 quarantine the dead key, on a
+        # plain rate-limit 429 shrink the rate so the herd backs off.
         self._tts_rl.acquire()
+        client = self._next_client()
         try:
-            response = self._next_client().models.generate_content(
+            response = client.models.generate_content(
                 model=settings.GEMINI_TTS_MODEL,
                 contents=contents,
                 config=types.GenerateContentConfig(
@@ -310,7 +339,9 @@ class AssetFactory:
                 ),
             )
         except Exception as exc:
-            if _is_rate_limit_error(exc):
+            if _is_spend_cap_error(exc):
+                self._quarantine_client(client)
+            elif _is_rate_limit_error(exc):
                 self._tts_rl.penalize()
             raise
         self._tts_rl.recover()
@@ -754,15 +785,21 @@ class AssetFactory:
         full_prompt = f"{medium_line}{body}"
 
         log.info("  [visual/dextora] scene %d generating keyframe…", scene.scene_id)
-        response = self._next_client().models.generate_images(
-            model=settings.GEMINI_IMAGE_MODEL,
-            prompt=full_prompt,
-            config=types.GenerateImagesConfig(
-                number_of_images=1,
-                aspect_ratio="16:9",
-                output_mime_type="image/png",
-            ),
-        )
+        client = self._next_client()
+        try:
+            response = client.models.generate_images(
+                model=settings.GEMINI_IMAGE_MODEL,
+                prompt=full_prompt,
+                config=types.GenerateImagesConfig(
+                    number_of_images=1,
+                    aspect_ratio="16:9",
+                    output_mime_type="image/png",
+                ),
+            )
+        except Exception as exc:
+            if _is_spend_cap_error(exc):
+                self._quarantine_client(client)
+            raise
         if not response.generated_images:
             # Safety filter — deterministic, do not retry; caller makes a fallback slide.
             raise ImagenBlockedError(
