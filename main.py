@@ -39,7 +39,7 @@ def _setup_logging(level: str = "INFO") -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Faceless YouTube pipeline")
+    parser = argparse.ArgumentParser(description="Dextora YouTube pipeline")
     parser.add_argument("--dry-run", action="store_true", help="Skip YouTube upload")
     parser.add_argument(
         "--phase",
@@ -60,6 +60,9 @@ def main() -> None:
         help="Narration profile: indian_english, british_english, american_english, hindi, hinglish",
     )
     parser.add_argument("--output-dir", help="Per-video output dir (enables isolated parallel runs)")
+    parser.add_argument("--from-script", help="Path to a portal script JSON → generate a video from its "
+                                              "audio_script + visual_directions, SKIPPING Phase 2 (curriculum bridge)")
+    parser.add_argument("--subject", default="", help="Subject name (selects visual style brief) for --from-script")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args()
 
@@ -68,8 +71,8 @@ def main() -> None:
     # Set overrides BEFORE importing settings so they're picked up at module load.
     if args.output_dir:
         os.environ["OUTPUT_DIR"] = args.output_dir
-    if args.prompt:
-        os.environ["VISUAL_STYLE"] = STYLE_MAP[args.style]
+    if args.prompt or args.from_script:
+        os.environ["VISUAL_STYLE"] = STYLE_MAP.get(args.style, "academic_science")
         os.environ["NARRATION_LANGUAGE"] = args.lang
 
     # Import after env is set so settings.py picks up overrides
@@ -77,6 +80,10 @@ def main() -> None:
 
     _setup_logging(args.log_level or settings.LOG_LEVEL)
     log = logging.getLogger(__name__)
+
+    if args.from_script:
+        _run_from_script(args.from_script, args.subject)
+        return
 
     if args.prompt:
         _run_generate(args.prompt, args.style)
@@ -133,6 +140,33 @@ def _run_generate(prompt: str, style: str) -> None:
 
     log.info("✅ Done — downloadable video: %s (%.1fs)",
              result.final_video_path, result.duration_seconds)
+    print(f"\nVIDEO_READY: {result.final_video_path}")
+
+
+def _run_from_script(script_path: str, subject: str = "") -> None:
+    """Curriculum-bridge flow: a portal script (audio_script + visual_directions) →
+    one video. SKIPS Phase 2 — the portal authored the script. Phase 3 (assets) →
+    Phase 4 (assemble). Narration is used verbatim from the portal."""
+    import json
+    from pathlib import Path
+
+    from config import settings
+    from pipeline.script_ingest import build_script_from_portal
+    from pipeline.phase3_assets import AssetFactory
+    from pipeline.phase4_editor import VideoEditor
+
+    log = logging.getLogger(__name__)
+    item = json.loads(Path(script_path).read_text(encoding="utf-8"))
+    log.info("From portal script id=%s lang=%s — '%s'",
+             item.get("id"), item.get("language"), str(item.get("title"))[:60])
+    settings.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    script = build_script_from_portal(item, subject_name=subject)
+    log.info("Ingested → %d scenes (no Phase 2; narration verbatim from portal)", len(script.scenes))
+    bundle = AssetFactory().run(script)
+    result = VideoEditor().run(bundle)
+
+    log.info("✅ Done — video: %s (%.1fs)", result.final_video_path, result.duration_seconds)
     print(f"\nVIDEO_READY: {result.final_video_path}")
 
 

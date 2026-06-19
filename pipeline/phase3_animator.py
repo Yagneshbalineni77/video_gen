@@ -1,6 +1,6 @@
 """
 Phase 3 – Code-Driven Animation Engine
-1. Gemini TTS  → per-scene narration .wav files
+1. Dextora TTS  → per-scene narration .wav files
 2. mutagen     → exact duration measurement → written back into script JSON
 3. Gemini Script → writes GSAP HTML5 animation for each scene
 4. Playwright  → loads HTML, screen-records to exact duration, saves MP4
@@ -16,7 +16,9 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential
-from playwright.sync_api import sync_playwright
+# NOTE: playwright is imported lazily inside the render method below, so a host
+# that lacks it (or its Chromium) degrades to the Veo fallback instead of
+# crashing the whole pipeline at import time.
 
 from config import settings
 from schemas.models import AssetBundle, AudioAsset, SceneScript, VideoScript, VisualAsset
@@ -96,7 +98,7 @@ class AnimatorFactory:
         out.write_text(script.model_dump_json(indent=2), encoding="utf-8")
         log.info("Script (with durations) saved -> %s", out)
 
-    # ── audio via Gemini TTS ─────────────────────────────────────────────────
+    # ── audio via Dextora TTS ─────────────────────────────────────────────────
 
     def _generate_audio(self, script: VideoScript) -> list[AudioAsset]:
         assets: list[AudioAsset] = []
@@ -226,6 +228,7 @@ class AnimatorFactory:
         frames_dir = Path(tempfile.mkdtemp(prefix="anim_", dir=str(self._video_dir)))
 
         try:
+            from playwright.sync_api import sync_playwright  # lazy: missing → caller falls back to Veo
             html_str = html_path.read_text(encoding="utf-8")
             with sync_playwright() as p:
                 # --no-sandbox is required when running as root (e.g. in Docker);

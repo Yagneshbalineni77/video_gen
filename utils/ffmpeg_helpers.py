@@ -292,47 +292,47 @@ def _font_file() -> str | None:
     return None
 
 
-def burn_subtitles(video_path: Path, subtitle_path: Path, dest: Path, watermark: str | None = None) -> None:
+def burn_subtitles(video_path: Path, subtitle_path: Path | None, dest: Path, watermark: str | None = None) -> None:
     """Burn ASS/SRT subtitles into the video, and optionally a brand watermark
     in the top-right corner.
+
+    ``subtitle_path`` may be ``None`` (watermark-only / plain re-encode) so that an
+    upstream subtitle failure never loses the finished, branded video.
 
     Uses a relative sub path + cwd to avoid Windows drive-letter colon being
     misread as an FFmpeg filter option separator (e.g. ass='C:/...' → error).
     """
-    sub_name = subtitle_path.name
-    sub_cwd  = str(subtitle_path.parent.resolve())
+    filters: list[str] = []
+    sub_cwd: str | None = None
 
-    if subtitle_path.suffix.lower() == ".ass":
-        vf = f"ass={sub_name}"
-    else:
-        vf = (
-            f"subtitles={sub_name}"
-            ":force_style='FontName=Arial,FontSize=22,Bold=1,"
-            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-            "Outline=3,Shadow=1,Alignment=2'"
-        )
+    if subtitle_path is not None:
+        sub_name = subtitle_path.name
+        sub_cwd  = str(subtitle_path.parent.resolve())
+        if subtitle_path.suffix.lower() == ".ass":
+            filters.append(f"ass={sub_name}")
+        else:
+            filters.append(
+                f"subtitles={sub_name}"
+                ":force_style='FontName=Arial,FontSize=22,Bold=1,"
+                "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+                "Outline=3,Shadow=1,Alignment=2'"
+            )
 
     if watermark and watermark.strip():
         ff = _font_file()
         wm_text = watermark.strip().replace("\\", "").replace(":", r"\:").replace("'", "")
         font_opt = f"fontfile='{ff}':" if ff else ""
         # subtle, semi-transparent, top-right — clear of the bottom subtitles
-        vf += (
-            f",drawtext={font_opt}text='{wm_text}':fontsize=40:fontcolor=white@0.55:"
+        filters.append(
+            f"drawtext={font_opt}text='{wm_text}':fontsize=40:fontcolor=white@0.55:"
             "shadowcolor=black@0.5:shadowx=2:shadowy=2:x=w-tw-48:y=46"
         )
 
-    run_ffmpeg(
-        [
-            "-i", str(video_path.resolve()),
-            "-vf", vf,
-            "-c:v", "libx264", "-crf", "17", "-preset", PRESET,
-            "-c:a", "copy",
-            str(dest.resolve()),
-        ],
-        desc="burn subtitles",
-        cwd=sub_cwd,
-    )
+    args = ["-i", str(video_path.resolve())]
+    if filters:
+        args += ["-vf", ",".join(filters)]
+    args += ["-c:v", "libx264", "-crf", "17", "-preset", PRESET, "-c:a", "copy", str(dest.resolve())]
+    run_ffmpeg(args, desc="burn subtitles", cwd=sub_cwd)
 
 
 # ── thumbnail ─────────────────────────────────────────────────────────────────

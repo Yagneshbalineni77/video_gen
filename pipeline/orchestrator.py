@@ -35,7 +35,7 @@ class Pipeline:
 
     def run(self) -> list[PipelineRun]:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        console.rule(f"[bold cyan]Faceless Pipeline – run {run_id}")
+        console.rule(f"[bold cyan]Dextora Pipeline – run {run_id}")
 
         # Phase 1 – Trends
         console.print("\n[bold yellow]Phase 1[/bold yellow] – Trend Scraper")

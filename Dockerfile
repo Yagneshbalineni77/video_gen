@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ──────────────────────────────────────────────────────────────────────────────
-# Faceless Video Studio — self-contained image.
+# Dextora Creator — self-contained image.
 # Bundles every system dependency the pipeline needs so it "just runs":
 #   ffmpeg (assembly+mastering), Chromium (code_animator), Noto Devanagari +
 #   Liberation fonts (subtitles), and a pre-cached Whisper model.

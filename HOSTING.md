@@ -1,4 +1,4 @@
-# Hosting — Faceless Video Studio
+# Hosting — Dextora Creator
 
 The whole app (FastAPI backend + web UI + the full video pipeline) ships in one
 Docker image. The only thing you must supply is a **Gemini API key**.
@@ -43,6 +43,21 @@ docker run -p 8000:8000 \
 | `ADMIN_EMAILS` | — | Comma-separated emails granted admin (see all jobs) on signup. |
 | `JWT_SECRET` | auto | Login token signing key; auto-generated + persisted if unset. |
 | `WATERMARK_TEXT` | `Dextora` | Brand watermark burned top-right; `""` disables. |
+| `GEMINI_API_KEYS` | — | Key pool: `key1,key2,…` → round-robins API calls to dodge per-key rate limits. Keys must be from **separate projects** to multiply quota. Falls back to `GEMINI_API_KEY`. |
+| `SKIP_VEO` | `false` | Fast mode: skip Veo motion, build from Imagen keyframes + Ken Burns (~3× faster, no motion). |
+| `GEMINI_IMAGE_MODEL` | `imagen-4.0-ultra-generate-001` | Keyframe model; set to `imagen-4.0-generate-001` for faster/cheaper. |
+| `PORTAL_API_KEY` | — | If set, the portal must send it as `X-API-Key` on `/api/v1/videos`. Blank = open. |
+| `PORTAL_API_URL` | dextora.org curriculum endpoint | Where the curriculum bridge pulls authored scripts from. |
+
+## Curriculum bridge (education-portal integration)
+The portal authors scripts; this app generates the videos and serves them keyed by
+the portal's own script `id`. Endpoints the portal calls are documented in
+**`PORTAL_API.md`** (with an importable `dextora_portal_api.postman_collection.json`):
+- `GET /api/v1/videos?ids=…` / `?class_id&subject_id&chapter_id` — finished video URLs + status
+- `GET /api/v1/videos/{id}/file` — the MP4
+- `POST /api/v1/bridge/run` (admin) — generate a whole chapter (EN + HI supported)
+
+The store (`output/portal_videos.db`) persists with the mounted `output/` volume.
 
 ## Accounts / login
 The web UI requires login. Users **sign up with the shared `SIGNUP_INVITE_CODE`**

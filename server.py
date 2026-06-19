@@ -28,7 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -62,7 +62,7 @@ LANGUAGES = [
 ]
 VALID_LANG_KEYS = {l["key"] for l in LANGUAGES}
 
-app = FastAPI(title="Faceless Video Studio")
+app = FastAPI(title="Dextora Creator")
 auth.init_db()
 
 # ── authentication ───────────────────────────────────────────────────────────
@@ -277,8 +277,11 @@ def _progress_from_log(run_dir: str) -> dict:
     m = re.search(r"generating assets for (\d+) scenes", text)
     if m:
         scenes_total = int(m.group(1))
-    scenes_done = len(re.findall(r"\[veo3\] scene \d+ clip 0 done", text)) \
-        + len(re.findall(r"\[animator\] scene \d+ ->", text))
+    keyframes_done = len(re.findall(r"\[visual/dextora\] scene \d+ ->", text))
+    veo_done = len(re.findall(r"\[dextora\] scene \d+ clip 0 done", text))
+    anim_done = len(re.findall(r"\[animator\] scene \d+ ->", text))
+    scenes_done = max(keyframes_done, veo_done) + anim_done
+    fast_mode = "FAST MODE (SKIP_VEO)" in text
 
     if "Phase 2 – generating script" in text:
         phase, percent = "Writing script", 8
@@ -286,10 +289,18 @@ def _progress_from_log(run_dir: str) -> dict:
         phase, percent = "Script ready", 12
     if "Phase 3 – generating assets" in text:
         phase = "Generating visuals"
-        if scenes_total:
-            percent = 15 + int(65 * scenes_done / max(scenes_total, 1))
-        else:
+        if not scenes_total:
             percent = 15
+        elif fast_mode:
+            # keyframes ARE the whole visual stage → advance 15→80 as they complete
+            done = min(keyframes_done + anim_done, scenes_total)
+            percent = 15 + int(65 * done / scenes_total)
+        else:
+            # full Veo: Pass-1 keyframes → 15..45, Pass-2 clips → 45..80 (so it never
+            # sits frozen at 15 through the keyframe pass)
+            kf = min(keyframes_done, scenes_total)
+            vd = min(veo_done + anim_done, scenes_total)
+            percent = 15 + int(30 * kf / scenes_total) + int(35 * vd / scenes_total)
     if "Phase 4 – assembling" in text:
         # Finer Phase 4 granularity so the bar keeps moving through the (CPU-heavy)
         # assembly instead of sitting at one number.
@@ -437,6 +448,223 @@ def job_download(job_id: str, token: str = "") -> FileResponse:
         raise HTTPException(403, "not your job")
     name = f"{_slug(job['prompt'])}_{job['style']}.mp4"
     return FileResponse(job["video"], media_type="video/mp4", filename=name)
+
+
+# ── curriculum bridge: the education portal fetches finished videos here ──────
+import portal_bridge  # noqa: E402
+
+
+def _key_qs() -> str:
+    """`?key=...` suffix appended to media URLs when PORTAL_API_KEY is set, so the
+    portal can embed them directly in <video>/<img> tags (browsers can't send the
+    X-API-Key header on those). Empty when no key is configured."""
+    k = os.getenv("PORTAL_API_KEY", "")
+    return f"?key={k}" if k else ""
+
+
+def _portal_video_url(request: Request, script_id: int) -> str:
+    return f"{str(request.base_url).rstrip('/')}/api/v1/videos/{script_id}/file{_key_qs()}"
+
+
+def _portal_audio_url(request: Request, script_id: int) -> str:
+    return f"{str(request.base_url).rstrip('/')}/api/v1/videos/{script_id}/audio{_key_qs()}"
+
+
+def _portal_thumb_url(request: Request, script_id: int) -> str:
+    return f"{str(request.base_url).rstrip('/')}/api/v1/videos/{script_id}/thumbnail{_key_qs()}"
+
+
+def _portal_key_ok(request: Request) -> bool:
+    """Optional auth: if PORTAL_API_KEY is set, require it — either in the X-API-Key
+    header (for API calls) OR a ?key= query param (so embedded media URLs work)."""
+    want = os.getenv("PORTAL_API_KEY", "")
+    if not want:
+        return True
+    return request.headers.get("X-API-Key") == want or request.query_params.get("key") == want
+
+
+@app.get("/api/v1/videos")
+def portal_videos(request: Request, ids: str = "", class_id: int | None = None,
+                  subject_id: int | None = None, chapter_id: int | None = None) -> JSONResponse:
+    """Portal-facing: finished video URLs keyed by the portal's own script id.
+    Query by ?ids=881,882  OR  ?class_id=11&subject_id=49&chapter_id=509."""
+    if not _portal_key_ok(request):
+        raise HTTPException(401, "invalid or missing X-API-Key")
+    id_list = [int(i) for i in ids.split(",") if i.strip().isdigit()] or None
+    rows = portal_bridge.get_videos(ids=id_list, class_id=class_id,
+                                    subject_id=subject_id, chapter_id=chapter_id)
+    videos = []
+    for r in rows:
+        ready = r["status"] == "done" and r.get("video_path")
+        videos.append({
+            "id": r["script_id"], "atom_id": r["atom_id"], "chapter_id": r["chapter_id"],
+            "subject_id": r["subject_id"], "language": r["language"], "title": r["title"],
+            "status": r["status"], "duration": r["duration"],
+            "video_url": _portal_video_url(request, r["script_id"]) if ready else None,
+            "audio_url": _portal_audio_url(request, r["script_id"]) if ready else None,
+            "thumbnail_url": _portal_thumb_url(request, r["script_id"]) if ready else None,
+        })
+    return JSONResponse({"count": len(videos), "videos": videos})
+
+
+@app.get("/api/v1/videos/{script_id}/file")
+def portal_video_file(script_id: int, request: Request) -> FileResponse:
+    if not _portal_key_ok(request):
+        raise HTTPException(401, "invalid or missing X-API-Key")
+    rows = portal_bridge.get_videos(ids=[script_id])
+    if not rows or rows[0]["status"] != "done" or not rows[0].get("video_path"):
+        raise HTTPException(404, "video not ready")
+    path = rows[0]["video_path"]
+    if not os.path.exists(path):
+        raise HTTPException(404, "video file missing")
+    return FileResponse(path, media_type="video/mp4", filename=f"script_{script_id}.mp4")
+
+
+@app.get("/api/v1/videos/{script_id}/audio")
+def portal_video_audio(script_id: int, request: Request) -> FileResponse:
+    """Narration audio (MP3) for one script — extracted from the final video on first
+    request and cached. For the portal's 'Listen' feature."""
+    if not _portal_key_ok(request):
+        raise HTTPException(401, "invalid or missing X-API-Key")
+    rows = portal_bridge.get_videos(ids=[script_id])
+    if not rows or rows[0]["status"] != "done" or not rows[0].get("video_path"):
+        raise HTTPException(404, "audio not ready")
+    video_path = Path(rows[0]["video_path"])
+    if not video_path.exists():
+        raise HTTPException(404, "video file missing")
+    audio_path = video_path.parent / f"{video_path.stem}.mp3"
+    if not audio_path.exists():
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path),
+                 "-vn", "-acodec", "libmp3lame", "-q:a", "4", str(audio_path)],
+                check=True, timeout=180,
+            )
+        except Exception as exc:
+            raise HTTPException(500, f"audio extraction failed: {exc}")
+    return FileResponse(str(audio_path), media_type="audio/mpeg", filename=f"script_{script_id}.mp3")
+
+
+@app.get("/api/v1/videos/{script_id}/thumbnail")
+def portal_video_thumbnail(script_id: int, request: Request) -> FileResponse:
+    """Thumbnail (JPG) for one script — the clean scene-1 keyframe if available, else a
+    frame grabbed a few seconds into the video. Generated on first request and cached."""
+    if not _portal_key_ok(request):
+        raise HTTPException(401, "invalid or missing X-API-Key")
+    rows = portal_bridge.get_videos(ids=[script_id])
+    if not rows or rows[0]["status"] != "done" or not rows[0].get("video_path"):
+        raise HTTPException(404, "thumbnail not ready")
+    video_path = Path(rows[0]["video_path"])
+    if not video_path.exists():
+        raise HTTPException(404, "video file missing")
+    thumb_path = video_path.parent / f"{video_path.stem}_thumb.jpg"
+    if not thumb_path.exists():
+        keyframe = video_path.parent.parent / "video" / "scene_1_keyframe.png"
+        try:
+            if keyframe.exists():
+                src = ["-i", str(keyframe)]
+            else:
+                src = ["-ss", "3", "-i", str(video_path)]  # grab a frame ~3s in
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", *src, "-vframes", "1",
+                 "-vf", "scale=1280:-2", "-q:v", "3", str(thumb_path)],
+                check=True, timeout=60,
+            )
+        except Exception as exc:
+            raise HTTPException(500, f"thumbnail generation failed: {exc}")
+    return FileResponse(str(thumb_path), media_type="image/jpeg", filename=f"script_{script_id}.jpg")
+
+
+@app.get("/api/v1/videos/{script_id}/log")
+def portal_video_log(script_id: int, request: Request, lines: int = 80) -> JSONResponse:
+    """Live backend log + progress for one script's render — per-run visibility
+    without host shell access. Returns phase, percent, scene counts, and the log tail."""
+    if not _portal_key_ok(request):
+        raise HTTPException(401, "invalid or missing X-API-Key")
+    run_dir = portal_bridge.RUNS_DIR / f"script_{script_id}"
+    log_path = run_dir / "run.log"
+    if not log_path.exists():
+        raise HTTPException(404, "no log for this script yet")
+    prog = _progress_from_log(str(run_dir))
+    n = max(1, min(lines, 1000))
+    tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
+    return JSONResponse({
+        "script_id": script_id,
+        "phase": prog.get("phase"),
+        "percent": prog.get("percent"),
+        "scenes_done": prog.get("scenes_done"),
+        "scenes_total": prog.get("scenes_total"),
+        "log_tail": tail,
+    })
+
+
+# ── push-generate: the portal sends us a script, we render + store by its id ──
+from concurrent.futures import ThreadPoolExecutor as _ThreadPool  # noqa: E402
+_portal_gen_pool = _ThreadPool(max_workers=int(os.getenv("PORTAL_GEN_WORKERS", "2")))
+
+
+class GenerateScriptReq(BaseModel):
+    id: int                              # the portal's script id — results keyed by this
+    audio_script: str                    # narration text (required)
+    title: str = ""
+    visual_directions: str = ""
+    language: str = "English"            # English | Hindi
+    subject: str = ""                    # subject name → visual style
+    duration_seconds: int | None = None
+    class_id: int | None = None
+    subject_id: int | None = None
+    chapter_id: int | None = None
+    script_type: str = "VIDEO"
+
+
+@app.post("/api/v1/generate")
+def portal_generate(req: GenerateScriptReq, request: Request) -> JSONResponse:
+    """Push-generate: the portal sends a full script (narration + visual directions),
+    we render the video and store it keyed by the portal's own `id`. Then poll
+    GET /api/v1/videos?ids=<id> for status + video/audio/thumbnail URLs."""
+    if not _portal_key_ok(request):
+        raise HTTPException(401, "invalid or missing X-API-Key")
+    if not (req.audio_script or "").strip():
+        raise HTTPException(400, "audio_script is required")
+    item = {
+        "id": req.id, "atom_id": None, "chapter_id": req.chapter_id,
+        "script_type": req.script_type, "language": req.language,
+        "title": req.title or f"script {req.id}",
+        "audio_script": req.audio_script, "visual_directions": req.visual_directions,
+        "duration_seconds": req.duration_seconds, "metadata": {},
+    }
+    portal_bridge.upsert(req.id, atom_id=None, chapter_id=req.chapter_id,
+                         subject_id=req.subject_id, class_id=req.class_id,
+                         script_type=req.script_type, language=req.language,
+                         title=item["title"], status="queued", video_path=None,
+                         duration=req.duration_seconds, error=None)
+    _portal_gen_pool.submit(portal_bridge.generate_one, item, req.subject, req.class_id, req.subject_id)
+    return JSONResponse({"id": req.id, "status": "queued"})
+
+
+class BridgeRunReq(BaseModel):
+    class_id: int
+    subject_id: int
+    chapter_id: int
+    subject: str = ""
+    languages: list[str] = ["English"]
+    types: list[str] = ["VIDEO"]
+    limit: int | None = None
+    workers: int = 2
+
+
+@app.post("/api/v1/bridge/run")
+def bridge_run(req: BridgeRunReq, user: dict = Depends(current_user)) -> JSONResponse:
+    """Admin-triggered mass generation for one chapter (runs in the background)."""
+    if user["role"] != "admin":
+        raise HTTPException(403, "admin only")
+    threading.Thread(
+        target=portal_bridge.run_chapter,
+        args=(req.class_id, req.subject_id, req.chapter_id, req.subject,
+              tuple(req.languages), tuple(req.types), req.limit, req.workers),
+        daemon=True,
+    ).start()
+    return JSONResponse({"started": True, **req.model_dump()})
 
 
 # ── frontend (mounted last so /api/* wins) ───────────────────────────────────

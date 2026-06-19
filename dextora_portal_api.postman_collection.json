@@ -1,0 +1,130 @@
+{
+  "info": {
+    "name": "Dextora Creator — Portal API (v1)",
+    "description": "Endpoints Dextora Creator exposes for the education portal. Set the collection variables `base_url`, `api_key` (optional), and `admin_token` (only for #4), then run the requests. Videos are keyed by the portal's own script `id`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "https://videogen.dextora.org", "type": "string" },
+    { "key": "api_key", "value": "", "type": "string" },
+    { "key": "admin_token", "value": "", "type": "string" },
+    { "key": "admin_email", "value": "dextoraedu@gmail.com", "type": "string" },
+    { "key": "admin_password", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Login (saves admin_token)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "var d = pm.response.json();",
+              "if (d && d.token) { pm.collectionVariables.set('admin_token', d.token); console.log('admin_token saved'); }"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"{{admin_email}}\",\n  \"password\": \"{{admin_password}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/auth/login",
+          "host": [ "{{base_url}}" ],
+          "path": [ "api", "auth", "login" ]
+        },
+        "description": "Run this first. Sets admin_email + admin_password as collection variables, then this auto-saves the returned token to admin_token (used by request #4)."
+      }
+    },
+    {
+      "name": "0. Generate a video (push)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-API-Key", "value": "{{api_key}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": 12345,\n  \"title\": \"Mole Concept\",\n  \"audio_script\": \"Today we explore the mole, the chemist's counting unit...\",\n  \"visual_directions\": \"0:00-0:10 -> 3D molecules; 0:10-0:30 -> balance showing 18g water\",\n  \"language\": \"English\",\n  \"subject\": \"Chemistry\",\n  \"duration_seconds\": 240,\n  \"class_id\": 11,\n  \"subject_id\": 49,\n  \"chapter_id\": 509,\n  \"script_type\": \"VIDEO\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/generate",
+          "host": [ "{{base_url}}" ],
+          "path": [ "api", "v1", "generate" ]
+        },
+        "description": "Push a full script; we render it and store it keyed by your `id`. Returns {id, status:queued}. Then poll request #1/#2 for the URLs."
+      }
+    },
+    {
+      "name": "1. Get videos by ids",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "X-API-Key", "value": "{{api_key}}" } ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/videos?ids=881,882,883",
+          "host": [ "{{base_url}}" ],
+          "path": [ "api", "v1", "videos" ],
+          "query": [ { "key": "ids", "value": "881,882,883" } ]
+        },
+        "description": "Fetch status + video_url/audio_url/thumbnail_url for specific script ids. URLs are set only when status == done."
+      }
+    },
+    {
+      "name": "2. Get videos by chapter",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "X-API-Key", "value": "{{api_key}}" } ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/videos?class_id=11&subject_id=49&chapter_id=509",
+          "host": [ "{{base_url}}" ],
+          "path": [ "api", "v1", "videos" ],
+          "query": [
+            { "key": "class_id", "value": "11" },
+            { "key": "subject_id", "value": "49" },
+            { "key": "chapter_id", "value": "509" }
+          ]
+        },
+        "description": "Fetch all generated videos for a class/subject/chapter."
+      }
+    },
+    {
+      "name": "3. Stream / download a video file",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "X-API-Key", "value": "{{api_key}}" } ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/videos/881/file",
+          "host": [ "{{base_url}}" ],
+          "path": [ "api", "v1", "videos", "881", "file" ]
+        },
+        "description": "Returns the MP4 (video/mp4). This is what video_url points to."
+      }
+    },
+    {
+      "name": "4. Trigger generation for a chapter (admin)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"class_id\": 11,\n  \"subject_id\": 49,\n  \"chapter_id\": 509,\n  \"subject\": \"Chemistry\",\n  \"languages\": [\"English\"],\n  \"types\": [\"VIDEO\"],\n  \"limit\": 5,\n  \"workers\": 2\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/bridge/run",
+          "host": [ "{{base_url}}" ],
+          "path": [ "api", "v1", "bridge", "run" ]
+        },
+        "description": "Optional. Kicks off background generation for a chapter. Requires an admin Bearer token. Poll #1 for results."
+      }
+    }
+  ]
+}

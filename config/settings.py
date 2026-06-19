@@ -11,6 +11,20 @@ ROOT = Path(__file__).parent.parent
 
 # ── Google AI ─────────────────────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
+
+
+def _gemini_api_keys() -> list[str]:
+    """Key pool for spreading API load across multiple keys to dodge per-key rate
+    limits. Set GEMINI_API_KEYS="key1,key2,key3" to enable round-robin; otherwise
+    falls back to the single GEMINI_API_KEY. NOTE: keys must be from SEPARATE Google
+    Cloud projects to actually multiply quota — keys in one project share its limit."""
+    raw = os.getenv("GEMINI_API_KEYS", "")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    return keys or [GEMINI_API_KEY]
+
+
+# Pool of API keys (>=1). Phase 3 round-robins its calls across these.
+GEMINI_API_KEYS: list[str] = _gemini_api_keys()
 GEMINI_SCRIPT_MODEL: str = os.getenv("GEMINI_SCRIPT_MODEL", "gemini-2.5-flash")
 # Imagen model for keyframes. Default to Imagen 4 ULTRA — it renders text/formulas
 # (CO2, F=ma) far more reliably than the standard model. Set GEMINI_IMAGE_MODEL=
@@ -33,6 +47,11 @@ VEO_LAST_FRAME: bool = os.getenv("VEO_LAST_FRAME", "false").lower() == "true"
 # so concurrency turns a serial 15-min render into ~one-clip wall-time. Keep modest to
 # avoid 429 rate-limit errors on AI Studio keys; raise on Vertex with provisioned quota.
 VEO_CONCURRENCY: int = int(os.getenv("VEO_CONCURRENCY", "4"))
+# FAST MODE: skip Veo motion entirely and build every scene from its Imagen keyframe
+# (Ken Burns zoom/pan in Phase 4) + narration + subtitles. Drops the multi-minute
+# per-clip Veo render — the pipeline's slowest stage — at the cost of full motion.
+# Videos are still narrated, subtitled, watermarked, with formula overlays.
+SKIP_VEO: bool = os.getenv("SKIP_VEO", "false").lower() == "true"
 
 # ── YouTube ───────────────────────────────────────────────────────────────────
 YOUTUBE_API_KEY: str = os.getenv("YOUTUBE_API_KEY", "")
