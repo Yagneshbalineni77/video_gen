@@ -64,7 +64,11 @@ class VideoEditor:
         # Step 4: single continuous narration track, then master it to broadcast
         # loudness/clarity (also evens out level differences between scenes).
         narration_raw = self._tmp / "narration_raw.wav"
-        concat_audio([a.path for a in bundle.audio_assets], narration_raw)
+        if bundle.language:
+            audio_paths = self._pad_audio_scenes(bundle.audio_assets, bundle.script.scenes)
+        else:
+            audio_paths = [a.path for a in bundle.audio_assets]
+        concat_audio(audio_paths, narration_raw)
         narration_wav = self._tmp / "narration_full.wav"
         try:
             master_narration(narration_raw, narration_wav)
@@ -89,25 +93,33 @@ class VideoEditor:
 
         # Step 7: subtitles. English → Whisper word-level (karaoke). Hindi/Hinglish →
         # build from the KNOWN script text (ASR is wrong-script/unreliable there).
+        # Bilingual Hindi pass → use ASR on the Hindi TTS audio (script text is English).
         sub_path = self._tmp / "subtitles.ass"
-        profile = settings.narration_profile()
+        if bundle.language == "hi":
+            # Use ASR on the Hindi audio — the narration text in script is English
+            sub_profile = {**settings.NARRATION_PROFILES.get("hindi", {}), "use_asr": True}
+        elif bundle.language == "en":
+            sub_profile = settings.NARRATION_PROFILES.get("indian_english", {})
+        else:
+            sub_profile = settings.narration_profile()
         subs_ready = False
         try:
-            if profile.get("use_asr", True):
-                transcribe_to_ass(narration_wav, sub_path, language=profile["whisper_lang"])
+            if sub_profile.get("use_asr", True):
+                transcribe_to_ass(narration_wav, sub_path, language=sub_profile["whisper_lang"])
             else:
                 from utils.whisper_captions import subtitles_from_scenes
                 dur_map = {a.scene_id: a.duration_ms for a in bundle.audio_assets}
                 items = [(s.narration, dur_map.get(s.scene_id, s.duration_ms or 4000))
                          for s in bundle.script.scenes]
-                subtitles_from_scenes(items, sub_path, font=profile.get("sub_font", "Arial"))
+                subtitles_from_scenes(items, sub_path, font=sub_profile.get("sub_font", "Arial"))
             subs_ready = sub_path.exists()
         except Exception as exc:
             log.warning("  [edit] subtitle generation failed (%s) — rendering without subtitles", exc)
 
         # Step 8: burn subtitles (+ brand watermark) → final render. Neither a subtitle
         # failure nor a burn failure may lose the finished video.
-        burned = self._tmp / "burned.mp4"
+        lang_suffix = f"_{bundle.language}" if bundle.language else ""
+        burned = self._tmp / f"burned{lang_suffix}.mp4"
         try:
             burn_subtitles(pre_sub, sub_path if subs_ready else None, burned,
                            watermark=settings.WATERMARK_TEXT)
@@ -121,7 +133,7 @@ class VideoEditor:
         # Step 9: hard-trim final output to exact narration audio length.
         # This eliminates any video overrun that BGM mixing or xfade padding can introduce
         # (e.g. a 13-min video with audio content at only 4:33 gets trimmed to 4:33).
-        final = self._render_dir / "final_render.mp4"
+        final = self._render_dir / f"final_render{lang_suffix}.mp4"
         narration_dur_s = probe_duration(narration_wav)
         burned_dur_s = probe_duration(burned)
         if burned_dur_s > narration_dur_s + 1.0:
@@ -137,6 +149,20 @@ class VideoEditor:
         return RenderResult(final_video_path=final, duration_seconds=duration, subtitle_path=sub_path)
 
     # ── private ──────────────────────────────────────────────────────────────
+
+    def _pad_audio_scenes(self, audio_assets: list, scenes: list) -> list:
+        from utils.ffmpeg_helpers import pad_audio_to_duration
+        dur_map = {s.scene_id: (s.duration_ms or 0) for s in scenes}
+        paths = []
+        for a in audio_assets:
+            target = dur_map.get(a.scene_id, 0)
+            if target > a.duration_ms + 50:
+                padded = self._tmp / f"scene_{a.scene_id}_padded.wav"
+                pad_audio_to_duration(a.path, target, padded)
+                paths.append(padded)
+            else:
+                paths.append(a.path)
+        return paths
 
     def _prepare_scene_clips(self, bundle: AssetBundle, fade_dur: float = 0.7) -> list[Path]:
         audio_map = {a.scene_id: a for a in bundle.audio_assets}

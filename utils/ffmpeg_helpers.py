@@ -278,6 +278,23 @@ def mix_bgm(video_path: Path, bgm_path: Path, dest: Path, bgm_db: float = -18.0)
     )
 
 
+def pad_audio_to_duration(src: Path, target_ms: int, dest: Path) -> None:
+    """Pad audio with silence if shorter than target_ms. Trim if longer. No-op within 50ms."""
+    import shutil as _sh
+    src_ms = int(probe_duration(src) * 1000)
+    if src_ms >= target_ms - 50:
+        if str(src) != str(dest):
+            _sh.copy2(src, dest)
+        return
+    run_ffmpeg(
+        ["-i", str(src),
+         "-af", f"apad=pad_dur={(target_ms - src_ms)/1000.0:.3f}",
+         "-t", f"{target_ms/1000.0:.3f}",
+         str(dest)],
+        desc=f"pad audio {src.name} to {target_ms}ms",
+    )
+
+
 # ── subtitles ─────────────────────────────────────────────────────────────────
 
 def _font_file() -> str | None:

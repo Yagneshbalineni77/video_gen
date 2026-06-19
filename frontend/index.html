@@ -136,10 +136,10 @@ const api = {
   langs:  () => fetch('/api/languages').then(r => r.json()),
   stats:  () => fetch('/api/stats', { headers: _hdr() }).then(r => r.json()),
   jobs:   () => fetch('/api/jobs', { headers: _hdr() }).then(_json),
-  gen:    (prompt, style, lang) => fetch('/api/generate', { method:'POST', headers:_hdr({'Content-Type':'application/json'}), body:JSON.stringify({prompt, style, lang}) }).then(_json),
+  gen:    (prompt, style, lang, bilingual=false) => fetch('/api/generate', { method:'POST', headers:_hdr({'Content-Type':'application/json'}), body:JSON.stringify({prompt, style, lang, bilingual}) }).then(_json),
   job:    (id) => fetch('/api/jobs/'+id, { headers: _hdr() }).then(_json),
   // media URLs carry the token as a query param (<video>/<a> can't send headers)
-  videoUrl: (id) => '/api/jobs/'+id+'/video?token=' + encodeURIComponent(TOKEN),
+  videoUrl: (id, lang='') => '/api/jobs/'+id+'/video?lang='+lang+'&token=' + encodeURIComponent(TOKEN),
   downloadUrl: (id) => '/api/jobs/'+id+'/download?token=' + encodeURIComponent(TOKEN),
   me:       () => fetch('/api/auth/me', { headers: _hdr() }).then(_json),
   login:    (email, password) => fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, password}) }).then(_json),
@@ -170,16 +170,22 @@ function StylePicker({ styles, value, onChange }) {
 function Single({ styles, langs }) {
   const [prompt,setPrompt]=useState(''); const [style,setStyle]=useState('educational');
   const [lang,setLang]=useState('indian_english');
+  const [bilingual,setBilingual]=useState(false);
   const [view,setView]=useState('form'); const [job,setJob]=useState(null);
   const [prog,setProg]=useState({phase:'',percent:0,scenes_done:0,scenes_total:0,tail:''});
-  const [err,setErr]=useState(''); const poll=useRef(null);
+  const [err,setErr]=useState('');
+  const [activeLang,setActiveLang]=useState('en');
+  const [isBilingual,setIsBilingual]=useState(false);
+  const poll=useRef(null);
+  const videoRef=useRef(null);
   useEffect(()=>()=>clearInterval(poll.current),[]);
 
   const start=useCallback(async()=>{
     if(!prompt.trim())return; setView('progress'); setErr('');
     setProg({phase:'starting',percent:2,scenes_done:0,scenes_total:0,tail:''});
     try{
-      const {job_id}=await api.gen(prompt,style,lang); setJob(job_id);
+      const {job_id}=await api.gen(prompt,style,lang,bilingual);
+      setJob(job_id); setIsBilingual(bilingual); setActiveLang('en');
       poll.current=setInterval(async()=>{
         const s=await api.job(job_id);
         if(s.status==='running'||s.status==='queued')setProg(s);
@@ -187,8 +193,18 @@ function Single({ styles, langs }) {
         else if(s.status==='error'){clearInterval(poll.current);setErr(s.error||'failed');setView('error');}
       },1600);
     }catch(e){setErr(e.message);setView('error');}
-  },[prompt,style,lang]);
+  },[prompt,style,lang,bilingual]);
   const reset=()=>{clearInterval(poll.current);setView('form');setJob(null);setErr('');};
+
+  const switchLang=(newLang)=>{
+    const v=videoRef.current;
+    if(!v)return;
+    const t=v.currentTime; const playing=!v.paused;
+    v.src=api.videoUrl(job,newLang);
+    v.load();
+    v.addEventListener('loadedmetadata',()=>{ v.currentTime=t; if(playing)v.play(); },{once:true});
+    setActiveLang(newLang);
+  };
 
   if(view==='form') return html`<div>
     <div class="hero"><h2>Turn a prompt into a <span class="g">cinematic video</span>.</h2>
@@ -201,6 +217,14 @@ function Single({ styles, langs }) {
       <${StylePicker} styles=${styles} value=${style} onChange=${setStyle}/>
       <div class="label" style=${{marginTop:'22px'}}>Narration · accent & language</div>
       <${LangPicker} langs=${langs} value=${lang} onChange=${setLang}/>
+      <div style=${{marginTop:'16px',display:'flex',alignItems:'center',gap:'10px'}}>
+        <label style=${{display:'flex',alignItems:'center',gap:'8px',cursor:'pointer',fontSize:'14px',color:'var(--text)'}}>
+          <input type="checkbox" checked=${bilingual} onChange=${e=>setBilingual(e.target.checked)}
+                 style=${{width:'16px',height:'16px',accentColor:'var(--acc)'}}/>
+          <span>Bilingual <b>EN + HI</b></span>
+          <span style=${{opacity:'.5',fontSize:'12px'}}>generates both English & Hindi audio</span>
+        </label>
+      </div>
       <button class="gen" style=${{marginTop:'22px'}} disabled=${!prompt.trim()} onClick=${start}>✦ Generate Video</button>
     </div></div>`;
   if(view==='progress') return html`<div>
@@ -213,9 +237,19 @@ function Single({ styles, langs }) {
     </div></div>`;
   if(view==='done') return html`<div>
     <div class="hero"><h2>✨ Your video is ready</h2><p>${prompt}</p></div>
-    <div class="card"><video src=${api.videoUrl(job)} controls autoplay playsinline></video>
-      <div class="row"><a class="btn-2 btn-dl" href=${api.downloadUrl(job)}>⬇ Download MP4</a>
-        <div class="btn-2 btn-again" onClick=${reset}>↻ Generate another</div></div></div></div>`;
+    <div class="card">
+      ${isBilingual ? html`<div style=${{display:'flex',gap:'8px',marginBottom:'12px'}}>
+        <button class=${'tab'+(activeLang==='en'?' on':'')} onClick=${()=>switchLang('en')}
+                style=${{padding:'8px 18px',fontSize:'13px',cursor:'pointer'}}>🇬🇧 English</button>
+        <button class=${'tab'+(activeLang==='hi'?' on':'')} onClick=${()=>switchLang('hi')}
+                style=${{padding:'8px 18px',fontSize:'13px',cursor:'pointer'}}>🇮🇳 Hindi</button>
+      </div>` : null}
+      <video ref=${videoRef} src=${api.videoUrl(job, isBilingual?activeLang:'')} controls autoplay playsinline></video>
+      <div class="row">
+        <a class="btn-2 btn-dl" href=${api.videoUrl(job, isBilingual?activeLang:'')}>⬇ Download MP4</a>
+        <div class="btn-2 btn-again" onClick=${reset}>↻ Generate another</div>
+      </div>
+    </div></div>`;
   return html`<div><div class="hero"><h2>Something went wrong</h2></div>
     <div class="card"><div class="errbox">${err}</div>
       <div class="row"><div class="btn-2 btn-again" onClick=${reset}>← Try again</div></div></div></div>`;

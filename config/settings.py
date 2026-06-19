@@ -175,18 +175,21 @@ NARRATION_PROFILES: dict = {
         "script_lang": "English",
         "tts_directive": "speaking in a natural, clear Indian English accent",
         "whisper_lang": "en", "use_asr": False, "sub_font": "Arial",
+        "voice": "Charon",
     },
     "british_english": {
         "label": "British English",
         "script_lang": "English",
         "tts_directive": "speaking in a refined British English (Received Pronunciation) accent",
         "whisper_lang": "en", "use_asr": False, "sub_font": "Arial",
+        "voice": "Charon",
     },
     "american_english": {
         "label": "American English",
         "script_lang": "English",
         "tts_directive": "speaking in a neutral American English accent",
         "whisper_lang": "en", "use_asr": False, "sub_font": "Arial",
+        "voice": "Charon",
     },
     "hindi": {
         "label": "Hindi",
@@ -195,6 +198,7 @@ NARRATION_PROFILES: dict = {
         # ASR (Whisper base) is unreliable for Hindi (wrong script) — build subtitles
         # from the known Devanagari script text instead, rendered with a Devanagari font.
         "whisper_lang": "hi", "use_asr": False, "sub_font": "Noto Sans Devanagari",
+        "voice": "Kore",
     },
     "hinglish": {
         "label": "Hinglish",

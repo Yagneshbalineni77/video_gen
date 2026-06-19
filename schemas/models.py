@@ -111,6 +111,7 @@ class AssetBundle(BaseModel):
     audio_assets: list[AudioAsset]
     visual_assets: list[VisualAsset]
     bgm_path: Optional[Path] = None
+    language: str = ""  # empty = monolingual; "en" or "hi" = bilingual render pass
 
 
 # ─── Phase 4 ──────────────────────────────────────────────────────────────────

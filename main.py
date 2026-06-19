@@ -59,6 +59,7 @@ def main() -> None:
         default="indian_english",
         help="Narration profile: indian_english, british_english, american_english, hindi, hinglish",
     )
+    parser.add_argument("--bilingual", action="store_true", help="Generate both English and Hindi audio tracks")
     parser.add_argument("--output-dir", help="Per-video output dir (enables isolated parallel runs)")
     parser.add_argument("--from-script", help="Path to a portal script JSON → generate a video from its "
                                               "audio_script + visual_directions, SKIPPING Phase 2 (curriculum bridge)")
@@ -86,7 +87,7 @@ def main() -> None:
         return
 
     if args.prompt:
-        _run_generate(args.prompt, args.style)
+        _run_generate(args.prompt, args.style, bilingual=args.bilingual)
         return
 
     if args.phase:
@@ -104,7 +105,7 @@ def main() -> None:
     log.info("All runs completed successfully.")
 
 
-def _run_generate(prompt: str, style: str) -> None:
+def _run_generate(prompt: str, style: str, bilingual: bool = False) -> None:
     """Product flow: user prompt + style → one downloadable video.
     Phase 2 (script) → Phase 3 (assets) → Phase 4 (assemble). No scraping, no upload."""
     from datetime import datetime, timezone
@@ -135,12 +136,23 @@ def _run_generate(prompt: str, style: str) -> None:
     )
 
     script = ScriptWriter().run(trend)
-    bundle = AssetFactory().run(script)
-    result = VideoEditor().run(bundle)
+    factory = AssetFactory()
+    editor = VideoEditor()
 
-    log.info("✅ Done — downloadable video: %s (%.1fs)",
-             result.final_video_path, result.duration_seconds)
-    print(f"\nVIDEO_READY: {result.final_video_path}")
+    if bilingual:
+        en_bundle, hi_bundle = factory.run_bilingual(script)
+        r_en = editor.run(en_bundle)
+        r_hi = editor.run(hi_bundle)
+        log.info("Done — EN: %s (%.1fs)", r_en.final_video_path, r_en.duration_seconds)
+        log.info("Done — HI: %s (%.1fs)", r_hi.final_video_path, r_hi.duration_seconds)
+        print(f"VIDEO_READY_EN={r_en.final_video_path}")
+        print(f"VIDEO_READY_HI={r_hi.final_video_path}")
+    else:
+        bundle = factory.run(script)
+        result = editor.run(bundle)
+        log.info("Done — downloadable video: %s (%.1fs)",
+                 result.final_video_path, result.duration_seconds)
+        print(f"VIDEO_READY={result.final_video_path}")
 
 
 def _run_from_script(script_path: str, subject: str = "") -> None:

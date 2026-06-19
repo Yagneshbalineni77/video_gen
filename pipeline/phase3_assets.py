@@ -930,6 +930,98 @@ class AssetFactory:
         )
         list_file.unlink(missing_ok=True)
 
+    # ── bilingual EN+HI ──────────────────────────────────────────────────────
+
+    def _translate_to_hindi(self, script: "VideoScript") -> dict[int, str]:
+        lines = "\n".join(f"{s.scene_id}: {s.narration}" for s in script.scenes)
+        prompt = (
+            "Translate each numbered scene narration below to natural spoken Hindi "
+            "(Devanagari script). Keep the educational accuracy, tone, and meaning identical. "
+            "Return ONLY the translations, one per line, in the exact format: 'N: <hindi text>'\n\n"
+            + lines
+        )
+        try:
+            resp = self._next_client().models.generate_content(
+                model=settings.GEMINI_SCRIPT_MODEL, contents=prompt
+            )
+            result: dict[int, str] = {}
+            for line in resp.text.strip().split("\n"):
+                if ":" in line:
+                    head, _, body = line.partition(":")
+                    try:
+                        result[int(head.strip())] = body.strip()
+                    except ValueError:
+                        pass
+            log.info("  [bilingual] translated %d/%d scenes to Hindi", len(result), len(script.scenes))
+            return result
+        except Exception as exc:
+            log.warning("  [bilingual] translation failed (%s) — using English as fallback", exc)
+            return {}
+
+    def _gen_audio_scene_lang(self, scene_id: int, text: str, dest: Path, voice: str, tone: str) -> "AudioAsset":
+        from schemas.models import AudioAsset
+        if dest.exists():
+            log.info("  [audio] scene %d cached (%s)", scene_id, dest.name)
+            return AudioAsset(scene_id=scene_id, path=dest, duration_ms=self._wav_duration_ms(dest))
+        try:
+            self._tts(text, dest, voice=voice, tone=tone)
+        except Exception as exc:
+            log.warning("  [audio] scene %d TTS failed (%s); plain retry", scene_id, exc)
+            try:
+                self._tts(text, dest, voice=voice, plain=True)
+            except Exception as exc2:
+                secs = max(2.0, len(text.split()) / 2.6)
+                log.warning("  [audio] scene %d unrecoverable (%s); silence %.1fs", scene_id, exc2, secs)
+                self._write_silence(dest, secs)
+        return AudioAsset(scene_id=scene_id, path=dest, duration_ms=self._wav_duration_ms(dest))
+
+    def run_bilingual(self, script: "VideoScript") -> tuple["AssetBundle", "AssetBundle"]:
+        from concurrent.futures import ThreadPoolExecutor
+        from schemas.models import AssetBundle
+        log.info("Phase 3 (bilingual EN+HI) – %d scenes", len(script.scenes))
+
+        # 1. Translate to Hindi
+        hi_map = self._translate_to_hindi(script)
+
+        # EN/HI voice+tone
+        en_prof = settings.NARRATION_PROFILES.get("indian_english", {})
+        hi_prof = settings.NARRATION_PROFILES.get("hindi", {})
+        en_voice = en_prof.get("voice") or settings.GEMINI_TTS_VOICE
+        hi_voice = hi_prof.get("voice") or "Kore"
+        en_tone = settings.TTS_STYLE_PRESETS.get(settings.VISUAL_STYLE, {}).get("tone") or settings.TTS_DEFAULT.get("tone", "engaging educator")
+        hi_tone = en_tone  # same delivery style, different language
+
+        # 2. Generate EN + HI audio in parallel
+        def _gen_lang(lang_key: str, voice: str, tone: str, narration_map: dict) -> list:
+            assets = []
+            for scene in script.scenes:
+                text = narration_map.get(scene.scene_id) or scene.narration
+                dest = self._audio_dir / f"scene_{scene.scene_id}_{lang_key}.wav"
+                assets.append(self._gen_audio_scene_lang(scene.scene_id, text, dest, voice, tone))
+            return assets
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_en = ex.submit(_gen_lang, "en", en_voice, en_tone, {s.scene_id: s.narration for s in script.scenes})
+            f_hi = ex.submit(_gen_lang, "hi", hi_voice, hi_tone, hi_map)
+            en_audio = f_en.result()
+            hi_audio = f_hi.result()
+
+        # 3. Set scene.duration_ms = max(EN, HI) per scene
+        en_dur = {a.scene_id: a.duration_ms for a in en_audio}
+        hi_dur = {a.scene_id: a.duration_ms for a in hi_audio}
+        for scene in script.scenes:
+            scene.duration_ms = max(en_dur.get(scene.scene_id, 4000), hi_dur.get(scene.scene_id, 4000))
+        self._save_script(script)
+
+        # 4. Generate visuals ONCE at max durations
+        visual_assets = self._generate_visuals(script)
+        bgm = self._pick_bgm()
+
+        en_bundle = AssetBundle(script=script, audio_assets=en_audio, visual_assets=visual_assets, bgm_path=bgm, language="en")
+        hi_bundle = AssetBundle(script=script, audio_assets=hi_audio, visual_assets=visual_assets, bgm_path=bgm, language="hi")
+        log.info("Phase 3 (bilingual) done – EN:%d HI:%d audio assets", len(en_audio), len(hi_audio))
+        return en_bundle, hi_bundle
+
     # ── BGM ──────────────────────────────────────────────────────────────────
 
     def _pick_bgm(self) -> Path | None:

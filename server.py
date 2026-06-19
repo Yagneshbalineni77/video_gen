@@ -138,7 +138,7 @@ _pending: "_queuemod.Queue[str]" = _queuemod.Queue()
 
 # Persisted registry so a server restart doesn't lose job history / in-flight state.
 _STATE_FILE = RUNS / "_jobs.json"
-_PERSIST_KEYS = ("id", "status", "prompt", "style", "lang", "created", "run_dir", "video", "error", "user")
+_PERSIST_KEYS = ("id", "status", "prompt", "style", "lang", "created", "run_dir", "video", "video_en", "video_hi", "bilingual", "error", "user")
 
 
 def _save_jobs() -> None:
@@ -181,13 +181,14 @@ class GenerateReq(BaseModel):
     prompt: str
     style: str = "educational"
     lang: str = "indian_english"
+    bilingual: bool = False
 
 
 def _slug(prompt: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", prompt.lower()).strip("_")[:40] or "video"
 
 
-def _execute(job_id: str, prompt: str, style: str, lang: str) -> None:
+def _execute(job_id: str, prompt: str, style: str, lang: str, bilingual: bool = False) -> None:
     """Actually run one pipeline (or a cheap fake in SMOKE_TEST mode)."""
     job = _jobs[job_id]
     run_dir = RUNS / f"web_{job_id[:8]}_{_slug(prompt)}"
@@ -214,6 +215,8 @@ def _execute(job_id: str, prompt: str, style: str, lang: str) -> None:
         cmd = [PYTHON, str(ROOT / "main.py"),
                "--prompt", prompt, "--style", style, "--lang", lang,
                "--output-dir", str(run_dir.relative_to(ROOT))]
+        if bilingual:
+            cmd.append("--bilingual")
 
     try:
         with log_path.open("a", encoding="utf-8") as fh:
@@ -222,14 +225,27 @@ def _execute(job_id: str, prompt: str, style: str, lang: str) -> None:
         with _lock:
             job["pid"] = proc.pid
         proc.wait()
-        final = run_dir / "renders" / "final_render.mp4"
         with _lock:
-            if proc.returncode == 0 and final.exists():
-                job["status"] = "done"
-                job["video"] = str(final)
+            if bilingual:
+                final_en = run_dir / "renders" / "final_render_en.mp4"
+                final_hi = run_dir / "renders" / "final_render_hi.mp4"
+                if proc.returncode == 0 and final_en.exists():
+                    job["status"] = "done"
+                    job["video"] = str(final_en)  # backward compat
+                    job["video_en"] = str(final_en)
+                    if final_hi.exists():
+                        job["video_hi"] = str(final_hi)
+                else:
+                    job["status"] = "error"
+                    job["error"] = f"pipeline exited {proc.returncode}"
             else:
-                job["status"] = "error"
-                job["error"] = f"pipeline exited {proc.returncode}"
+                final = run_dir / "renders" / "final_render.mp4"
+                if proc.returncode == 0 and final.exists():
+                    job["status"] = "done"
+                    job["video"] = str(final)
+                else:
+                    job["status"] = "error"
+                    job["error"] = f"pipeline exited {proc.returncode}"
     except Exception as exc:  # pragma: no cover
         with _lock:
             job["status"] = "error"
@@ -244,7 +260,8 @@ def _worker() -> None:
         try:
             j = _jobs.get(job_id)
             if j and j["status"] == "queued":
-                _execute(job_id, j["prompt"], j["style"], j.get("lang", "indian_english"))
+                _execute(job_id, j["prompt"], j["style"], j.get("lang", "indian_english"),
+                         bilingual=j.get("bilingual", False))
         finally:
             _pending.task_done()
 
@@ -386,8 +403,9 @@ def generate(req: GenerateReq, user: dict = Depends(current_user)) -> JSONRespon
     with _lock:
         _jobs[job_id] = {
             "id": job_id, "status": "queued", "prompt": prompt, "style": req.style, "lang": req.lang,
+            "bilingual": req.bilingual,
             "created": datetime.now(timezone.utc).isoformat(),
-            "run_dir": "", "video": None, "error": None, "pid": None,
+            "run_dir": "", "video": None, "video_en": None, "video_hi": None, "error": None, "pid": None,
             "user": user["email"],
         }
         _order.append(job_id)
@@ -405,6 +423,8 @@ def job_status(job_id: str, user: dict = Depends(current_user)) -> JSONResponse:
         raise HTTPException(403, "not your job")
     out = {k: job[k] for k in ("id", "status", "prompt", "style", "error")}
     out["has_video"] = bool(job.get("video"))
+    out["bilingual"] = job.get("bilingual", False)
+    out["has_hi"] = bool(job.get("video_hi"))
     if job["status"] == "queued":
         pos = _queue_position(job_id)
         out.update({"phase": f"Queued (#{pos} in line)", "percent": 0,
@@ -428,14 +448,20 @@ def _user_from_query_token(token: str) -> dict:
 
 
 @app.get("/api/jobs/{job_id}/video")
-def job_video(job_id: str, token: str = "") -> FileResponse:
+def job_video(job_id: str, token: str = "", lang: str = "") -> FileResponse:
     user = _user_from_query_token(token)
     job = _jobs.get(job_id)
     if not job or not job.get("video"):
         raise HTTPException(404, "video not ready")
     if not _can_see(job, user):
         raise HTTPException(403, "not your job")
-    return FileResponse(job["video"], media_type="video/mp4")
+    if lang == "hi" and job.get("video_hi"):
+        video_path = job["video_hi"]
+    elif lang == "en" and job.get("video_en"):
+        video_path = job["video_en"]
+    else:
+        video_path = job["video"]
+    return FileResponse(video_path, media_type="video/mp4")
 
 
 @app.get("/api/jobs/{job_id}/download")
