@@ -56,6 +56,55 @@ def _vary_clip_prompt(base_prompt: str, clip_idx: int) -> str:
     return f"{base_prompt}. Camera: {angle}."
 
 
+class _RateLimiter:
+    """Thread-safe token bucket that paces API calls below a sustained RPM.
+
+    The 5-key pool shares one Google Cloud project, so it shares the TTS model's
+    per-minute quota — bursting 38 calls (19 scenes × 2 languages) trips 429s,
+    which used to fall back to silent scenes. This spaces calls out so the
+    sustained rate stays under the model limit, while still allowing a small
+    burst. Adaptive: a 429 shrinks the rate, sustained success slowly restores it."""
+
+    def __init__(self, rate_per_sec: float, burst: float) -> None:
+        self._base_rate = float(rate_per_sec)
+        self._rate = float(rate_per_sec)
+        self._capacity = float(burst)
+        self._tokens = float(burst)
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Block until a token is available, then consume it."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                # how long until the next token tops up
+                wait = (1.0 - self._tokens) / self._rate
+            time.sleep(min(wait, 2.0))
+
+    def penalize(self) -> None:
+        """A 429 was seen — halve the sustained rate (floor at 1/8 base) so the
+        herd backs off the shared quota."""
+        with self._lock:
+            self._rate = max(self._base_rate / 8.0, self._rate * 0.5)
+
+    def recover(self) -> None:
+        """A call succeeded — nudge the rate back toward base."""
+        with self._lock:
+            if self._rate < self._base_rate:
+                self._rate = min(self._base_rate, self._rate * 1.15)
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(t in s for t in ("429", "resource_exhausted", "rate limit", "quota", "exhausted"))
+
+
 class VeoBlockedError(RuntimeError):
     """Veo completed but returned no video — a safety/RAI filter block.
     Re-submitting the same prompt is pointless, so this is NOT retried."""
@@ -127,6 +176,9 @@ class AssetFactory:
         self._key_lock = threading.Lock()
         if len(self._clients) > 1:
             log.info("  [keys] API key pool active: %d keys (round-robin)", len(self._clients))
+        # Shared pacer for TTS so parallel EN+HI threads don't burst past the
+        # shared per-minute quota (the prime cause of silent-scene fallbacks).
+        self._tts_rl = _RateLimiter(settings.TTS_RATE_PER_SEC, settings.TTS_BURST)
         self._audio_dir = settings.OUTPUT_DIR / "audio"
         self._video_dir = settings.OUTPUT_DIR / "video"
         self._char_dir = settings.OUTPUT_DIR / "characters"
@@ -214,9 +266,17 @@ class AssetFactory:
 
             duration_ms = self._wav_duration_ms(wav_path)
             assets.append(AudioAsset(scene_id=scene.scene_id, path=wav_path, duration_ms=duration_ms))
+
+        # Self-heal any scene that fell back to silence (regenerate over cooldown
+        # rounds), then refresh durations from the regenerated WAVs.
+        heal_items = [(s.scene_id, s.narration, self._audio_dir / f"scene_{s.scene_id}.wav", voice, tone)
+                      for s in script.scenes]
+        self._heal_silent_scenes(heal_items, label="audio")
+        for a in assets:
+            a.duration_ms = self._wav_duration_ms(a.path)
         return assets
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=20))
+    @retry(stop=stop_after_attempt(5), wait=wait_random_exponential(multiplier=2, min=4, max=45))
     def _tts(self, text: str, dest: Path, voice: str | None = None,
              tone: str | None = None, plain: bool = False) -> None:
         voice = voice or settings.GEMINI_TTS_VOICE
@@ -234,18 +294,26 @@ class AssetFactory:
             if profile.get("tts_directive"):
                 directive = f"{directive}, {profile['tts_directive']}"
             contents = f"{directive}:\n\n{text}"
-        response = self._next_client().models.generate_content(
-            model=settings.GEMINI_TTS_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
-                    )
+        # Pace below the shared quota; on 429 shrink the rate so the herd backs off.
+        self._tts_rl.acquire()
+        try:
+            response = self._next_client().models.generate_content(
+                model=settings.GEMINI_TTS_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+                        )
+                    ),
                 ),
-            ),
-        )
+            )
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                self._tts_rl.penalize()
+            raise
+        self._tts_rl.recover()
         audio_data = self._extract_audio(response)
         with wave.open(str(dest), "wb") as wf:
             wf.setnchannels(1)
@@ -294,6 +362,32 @@ class AssetFactory:
             frames = w.getnframes()
             rate = w.getframerate()
             return int(frames / rate * 1000)
+
+    @staticmethod
+    def _is_silent_wav(path: Path) -> bool:
+        """True if the WAV is missing, empty, or pure silence (the failure
+        fallback). Used by the self-healing pass to find scenes to regenerate.
+        Checks peak amplitude over a sampled subset of 16-bit frames."""
+        try:
+            if not path.exists():
+                return True
+            with wave.open(str(path), "rb") as w:
+                n = w.getnframes()
+                if n == 0:
+                    return True
+                raw = w.readframes(n)
+        except Exception:
+            return True
+        # 16-bit signed little-endian; sample ~4000 frames for a fast peak check.
+        total = len(raw) // 2
+        if total == 0:
+            return True
+        stride = max(1, total // 4000)
+        for i in range(0, total, stride):
+            val = int.from_bytes(raw[i * 2:i * 2 + 2], "little", signed=True)
+            if abs(val) > 250:        # real speech easily exceeds this
+                return False
+        return True
 
     # ── script annotation ────────────────────────────────────────────────────
 
@@ -977,6 +1071,44 @@ class AssetFactory:
                 self._write_silence(dest, secs)
         return AudioAsset(scene_id=scene_id, path=dest, duration_ms=self._wav_duration_ms(dest))
 
+    def _heal_silent_scenes(self, items: list, *, label: str = "audio") -> int:
+        """Self-healing TTS: after the first pass, find every scene whose WAV is
+        silent (the 429 fallback) and regenerate it across cooldown rounds until
+        none remain. Returns how many were still silent at the end.
+
+        items: list of (scene_id, text, dest_path, voice, tone)."""
+        for rnd in range(1, settings.TTS_HEAL_ROUNDS + 1):
+            bad = [it for it in items if self._is_silent_wav(it[2])]
+            if not bad:
+                return 0
+            log.warning("  [%s] healing round %d/%d — %d silent scene(s): %s",
+                        label, rnd, settings.TTS_HEAL_ROUNDS, len(bad), [it[0] for it in bad])
+            time.sleep(settings.TTS_HEAL_COOLDOWN_SEC)   # let the quota window reset
+            for sid, text, dest, voice, tone in bad:
+                try:
+                    dest.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    self._tts(text, dest, voice=voice, tone=tone)
+                    log.info("  [%s] scene %d healed (round %d)", label, sid, rnd)
+                except Exception:
+                    try:
+                        self._tts(text, dest, voice=voice, plain=True)
+                        log.info("  [%s] scene %d healed plain (round %d)", label, sid, rnd)
+                    except Exception as exc:
+                        log.warning("  [%s] scene %d still failing (%s)", label, sid, exc)
+        # Last resort: any scene still silent gets proportional silence so the
+        # subtitle timing stays correct and the render completes.
+        still = [it for it in items if self._is_silent_wav(it[2])]
+        for sid, text, dest, voice, tone in still:
+            secs = max(2.0, len(text.split()) / 2.6)
+            self._write_silence(dest, secs)
+        if still:
+            log.warning("  [%s] %d scene(s) unrecoverable after %d rounds — silence written: %s",
+                        label, len(still), settings.TTS_HEAL_ROUNDS, [it[0] for it in still])
+        return len(still)
+
     def run_bilingual(self, script: "VideoScript") -> tuple["AssetBundle", "AssetBundle"]:
         from concurrent.futures import ThreadPoolExecutor
         from schemas.models import AssetBundle
@@ -994,6 +1126,9 @@ class AssetFactory:
         hi_tone = en_tone
 
         # 2. Generate EN + Hinglish audio in parallel
+        en_text = {s.scene_id: s.narration for s in script.scenes}
+        hi_text = {s.scene_id: (hi_map.get(s.scene_id) or s.narration) for s in script.scenes}
+
         def _gen_lang(lang_key: str, voice: str, tone: str, narration_map: dict) -> list:
             assets = []
             for scene in script.scenes:
@@ -1003,10 +1138,22 @@ class AssetFactory:
             return assets
 
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_en = ex.submit(_gen_lang, "en", en_voice, en_tone, {s.scene_id: s.narration for s in script.scenes})
+            f_en = ex.submit(_gen_lang, "en", en_voice, en_tone, en_text)
             f_hi = ex.submit(_gen_lang, "hi", hi_voice, hi_tone, hi_map)
             en_audio = f_en.result()
             hi_audio = f_hi.result()
+
+        # 2b. Self-heal any scene that fell back to silence (the audio-gap bug).
+        # Regenerate silent scenes over cooldown rounds so NO scene ships silent.
+        en_items = [(s.scene_id, en_text[s.scene_id], self._audio_dir / f"scene_{s.scene_id}_en.wav", en_voice, en_tone) for s in script.scenes]
+        hi_items = [(s.scene_id, hi_text[s.scene_id], self._audio_dir / f"scene_{s.scene_id}_hi.wav", hi_voice, hi_tone) for s in script.scenes]
+        self._heal_silent_scenes(en_items, label="audio-en")
+        self._heal_silent_scenes(hi_items, label="audio-hinglish")
+        # Refresh durations from the (possibly regenerated) WAVs before sync.
+        for a in en_audio:
+            a.duration_ms = self._wav_duration_ms(a.path)
+        for a in hi_audio:
+            a.duration_ms = self._wav_duration_ms(a.path)
 
         # 3. Set scene.duration_ms = max(EN, Hinglish) per scene so visuals are long enough
         en_dur = {a.scene_id: a.duration_ms for a in en_audio}

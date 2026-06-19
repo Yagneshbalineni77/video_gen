@@ -222,6 +222,17 @@ TTS_DEFAULT = {
     "voice": "Charon",
     "tone": "Read this aloud as a clear, confident narrator with a natural, measured pace",
 }
+
+# TTS request pacing — the key pool shares one project's per-minute quota, so we
+# pace calls below the model RPM instead of bursting (which trips 429 → silent
+# scenes). Tunable via env. ~1 call/sec sustained with a small burst is safe for
+# gemini-2.5-flash-preview-tts; raise if the keys are in SEPARATE projects.
+TTS_RATE_PER_SEC = float(os.getenv("TTS_RATE_PER_SEC", "1.0"))
+TTS_BURST = float(os.getenv("TTS_BURST", "3"))
+# Self-healing: how many extra rounds to regenerate any scene that fell back to
+# silence, and how long to cool down between rounds (lets the quota window reset).
+TTS_HEAL_ROUNDS = int(os.getenv("TTS_HEAL_ROUNDS", "3"))
+TTS_HEAL_COOLDOWN_SEC = float(os.getenv("TTS_HEAL_COOLDOWN_SEC", "20"))
 TTS_STYLE_PRESETS: dict = {
     "academic_science":   {"voice": "Charon", "tone": "Read this aloud as a clear, authoritative science educator — measured pace, confident and articulate, with crisp diction"},
     "cinematic_portrait": {"voice": "Aoede",  "tone": "Read this aloud as a warm, intimate narrator — natural, reflective, unhurried, with genuine feeling"},
