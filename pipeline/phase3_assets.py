@@ -932,12 +932,14 @@ class AssetFactory:
 
     # ── bilingual EN+HI ──────────────────────────────────────────────────────
 
-    def _translate_to_hindi(self, script: "VideoScript") -> dict[int, str]:
+    def _translate_to_hinglish(self, script: "VideoScript") -> dict[int, str]:
         lines = "\n".join(f"{s.scene_id}: {s.narration}" for s in script.scenes)
         prompt = (
-            "Translate each numbered scene narration below to natural spoken Hindi "
-            "(Devanagari script). Keep the educational accuracy, tone, and meaning identical. "
-            "Return ONLY the translations, one per line, in the exact format: 'N: <hindi text>'\n\n"
+            "Translate each numbered scene narration below to natural Hinglish — a conversational "
+            "mix of Hindi and English as spoken by young urban Indians, written entirely in Roman "
+            "(English) script (no Devanagari). Keep educational accuracy and tone identical. "
+            "Example style: 'Yeh concept bahut interesting hai, let's understand it step by step'. "
+            "Return ONLY the translations, one per line, in the exact format: 'N: <hinglish text>'\n\n"
             + lines
         )
         try:
@@ -952,7 +954,7 @@ class AssetFactory:
                         result[int(head.strip())] = body.strip()
                     except ValueError:
                         pass
-            log.info("  [bilingual] translated %d/%d scenes to Hindi", len(result), len(script.scenes))
+            log.info("  [bilingual] translated %d/%d scenes to Hinglish", len(result), len(script.scenes))
             return result
         except Exception as exc:
             log.warning("  [bilingual] translation failed (%s) — using English as fallback", exc)
@@ -978,20 +980,20 @@ class AssetFactory:
     def run_bilingual(self, script: "VideoScript") -> tuple["AssetBundle", "AssetBundle"]:
         from concurrent.futures import ThreadPoolExecutor
         from schemas.models import AssetBundle
-        log.info("Phase 3 (bilingual EN+HI) – %d scenes", len(script.scenes))
+        log.info("Phase 3 (bilingual EN+Hinglish) – %d scenes", len(script.scenes))
 
-        # 1. Translate to Hindi
-        hi_map = self._translate_to_hindi(script)
+        # 1. Translate to Hinglish (Roman script, no Devanagari)
+        hi_map = self._translate_to_hinglish(script)
 
-        # EN/HI voice+tone
+        # Both tracks use the same Charon voice — Hinglish is Indian-accented English
+        # with Hindi words mixed in, so the Indian English voice sounds natural for both.
         en_prof = settings.NARRATION_PROFILES.get("indian_english", {})
-        hi_prof = settings.NARRATION_PROFILES.get("hindi", {})
         en_voice = en_prof.get("voice") or settings.GEMINI_TTS_VOICE
-        hi_voice = hi_prof.get("voice") or "Kore"
+        hi_voice = en_voice  # Charon handles Hinglish naturally
         en_tone = settings.TTS_STYLE_PRESETS.get(settings.VISUAL_STYLE, {}).get("tone") or settings.TTS_DEFAULT.get("tone", "engaging educator")
-        hi_tone = en_tone  # same delivery style, different language
+        hi_tone = en_tone
 
-        # 2. Generate EN + HI audio in parallel
+        # 2. Generate EN + Hinglish audio in parallel
         def _gen_lang(lang_key: str, voice: str, tone: str, narration_map: dict) -> list:
             assets = []
             for scene in script.scenes:
@@ -1006,20 +1008,20 @@ class AssetFactory:
             en_audio = f_en.result()
             hi_audio = f_hi.result()
 
-        # 3. Set scene.duration_ms = max(EN, HI) per scene
+        # 3. Set scene.duration_ms = max(EN, Hinglish) per scene so visuals are long enough
         en_dur = {a.scene_id: a.duration_ms for a in en_audio}
         hi_dur = {a.scene_id: a.duration_ms for a in hi_audio}
         for scene in script.scenes:
             scene.duration_ms = max(en_dur.get(scene.scene_id, 4000), hi_dur.get(scene.scene_id, 4000))
         self._save_script(script)
 
-        # 4. Generate visuals ONCE at max durations
+        # 4. Generate visuals ONCE at max durations (shared between both tracks)
         visual_assets = self._generate_visuals(script)
         bgm = self._pick_bgm()
 
         en_bundle = AssetBundle(script=script, audio_assets=en_audio, visual_assets=visual_assets, bgm_path=bgm, language="en")
         hi_bundle = AssetBundle(script=script, audio_assets=hi_audio, visual_assets=visual_assets, bgm_path=bgm, language="hi")
-        log.info("Phase 3 (bilingual) done – EN:%d HI:%d audio assets", len(en_audio), len(hi_audio))
+        log.info("Phase 3 (bilingual) done – EN:%d Hinglish:%d audio assets", len(en_audio), len(hi_audio))
         return en_bundle, hi_bundle
 
     # ── BGM ──────────────────────────────────────────────────────────────────

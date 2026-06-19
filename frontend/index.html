@@ -221,8 +221,8 @@ function Single({ styles, langs }) {
         <label style=${{display:'flex',alignItems:'center',gap:'8px',cursor:'pointer',fontSize:'14px',color:'var(--text)'}}>
           <input type="checkbox" checked=${bilingual} onChange=${e=>setBilingual(e.target.checked)}
                  style=${{width:'16px',height:'16px',accentColor:'var(--acc)'}}/>
-          <span>Bilingual <b>EN + HI</b></span>
-          <span style=${{opacity:'.5',fontSize:'12px'}}>generates both English & Hindi audio</span>
+          <span>Bilingual <b>EN + Hinglish</b></span>
+          <span style=${{opacity:'.5',fontSize:'12px'}}>generates both English & Hinglish audio</span>
         </label>
       </div>
       <button class="gen" style=${{marginTop:'22px'}} disabled=${!prompt.trim()} onClick=${start}>✦ Generate Video</button>
@@ -242,7 +242,7 @@ function Single({ styles, langs }) {
         <button class=${'tab'+(activeLang==='en'?' on':'')} onClick=${()=>switchLang('en')}
                 style=${{padding:'8px 18px',fontSize:'13px',cursor:'pointer'}}>🇬🇧 English</button>
         <button class=${'tab'+(activeLang==='hi'?' on':'')} onClick=${()=>switchLang('hi')}
-                style=${{padding:'8px 18px',fontSize:'13px',cursor:'pointer'}}>🇮🇳 Hindi</button>
+                style=${{padding:'8px 18px',fontSize:'13px',cursor:'pointer'}}>🇮🇳 Hinglish</button>
       </div>` : null}
       <video ref=${videoRef} src=${api.videoUrl(job, isBilingual?activeLang:'')} controls autoplay playsinline></video>
       <div class="row">
@@ -284,7 +284,7 @@ function JobCard({ id, prompt, style }) {
         <button class=${'tab'+(cardLang==='en'?' on':'')} onClick=${()=>switchCardLang('en')}
                 style=${{padding:'5px 12px',fontSize:'12px',cursor:'pointer'}}>🇬🇧 EN</button>
         <button class=${'tab'+(cardLang==='hi'?' on':'')} onClick=${()=>switchCardLang('hi')}
-                style=${{padding:'5px 12px',fontSize:'12px',cursor:'pointer'}}>🇮🇳 HI</button>
+                style=${{padding:'5px 12px',fontSize:'12px',cursor:'pointer'}}>🇮🇳 Hinglish</button>
       </div>`:null}
       <video ref=${cardVid} src=${api.videoUrl(id,s.has_hi?cardLang:'')} controls playsinline></video>
       <a class="mini-dl" href=${api.videoUrl(id,s.has_hi?cardLang:'')}>⬇ Download</a>`

@@ -63,11 +63,10 @@ class VideoEditor:
 
         # Step 4: single continuous narration track, then master it to broadcast
         # loudness/clarity (also evens out level differences between scenes).
+        # Each language uses its own natural audio durations — no silence padding.
+        # Visuals were generated at max(EN,HI) duration so clips are always long enough.
         narration_raw = self._tmp / "narration_raw.wav"
-        if bundle.language:
-            audio_paths = self._pad_audio_scenes(bundle.audio_assets, bundle.script.scenes)
-        else:
-            audio_paths = [a.path for a in bundle.audio_assets]
+        audio_paths = [a.path for a in bundle.audio_assets]
         concat_audio(audio_paths, narration_raw)
         narration_wav = self._tmp / "narration_full.wav"
         try:
@@ -91,13 +90,14 @@ class VideoEditor:
         else:
             pre_sub = with_narration
 
-        # Step 7: subtitles. English → Whisper word-level (karaoke). Hindi/Hinglish →
-        # build from the KNOWN script text (ASR is wrong-script/unreliable there).
-        # Bilingual Hindi pass → use ASR on the Hindi TTS audio (script text is English).
+        # Step 7: subtitles.
+        # EN track → Whisper word-level ASR on English audio.
+        # Hinglish track (bundle.language=="hi") → ASR with whisper_lang="en" since
+        # Hinglish is Roman script; Whisper's English model handles it correctly.
         sub_path = self._tmp / "subtitles.ass"
         if bundle.language == "hi":
-            # Use ASR on the Hindi audio — the narration text in script is English
-            sub_profile = {**settings.NARRATION_PROFILES.get("hindi", {}), "use_asr": True}
+            # Hinglish is Roman script — use English Whisper ASR on the Hinglish audio
+            sub_profile = {**settings.NARRATION_PROFILES.get("hinglish", {}), "use_asr": True, "whisper_lang": "en"}
         elif bundle.language == "en":
             sub_profile = settings.NARRATION_PROFILES.get("indian_english", {})
         else:
