@@ -189,7 +189,7 @@ function Single({ styles, langs }) {
       poll.current=setInterval(async()=>{
         const s=await api.job(job_id);
         if(s.status==='running'||s.status==='queued')setProg(s);
-        else if(s.status==='done'){clearInterval(poll.current);setProg(p=>({...p,percent:100}));setView('done');}
+        else if(s.status==='done'){clearInterval(poll.current);setProg(p=>({...p,percent:100}));if(s.has_hi)setIsBilingual(true);setView('done');}
         else if(s.status==='error'){clearInterval(poll.current);setErr(s.error||'failed');setView('error');}
       },1600);
     }catch(e){setErr(e.message);setView('error');}
@@ -258,7 +258,9 @@ function Single({ styles, langs }) {
 /* ───────────────── batch mode ───────────────── */
 const TERMINAL = new Set(['done','error','interrupted']);
 function JobCard({ id, prompt, style }) {
-  const [s,setS]=useState({status:'queued',phase:'Queued',percent:0}); const poll=useRef(null);
+  const [s,setS]=useState({status:'queued',phase:'Queued',percent:0});
+  const [cardLang,setCardLang]=useState('en');
+  const cardVid=useRef(null); const poll=useRef(null);
   useEffect(()=>{
     poll.current=setInterval(async()=>{
       try{ const j=await api.job(id); setS(j);
@@ -267,12 +269,25 @@ function JobCard({ id, prompt, style }) {
     },1800);
     return ()=>clearInterval(poll.current);
   },[id]);
+  const switchCardLang=(l)=>{
+    const v=cardVid.current; if(!v)return;
+    const t=v.currentTime; const playing=!v.paused;
+    v.src=api.videoUrl(id,l); v.load();
+    v.addEventListener('loadedmetadata',()=>{v.currentTime=t;if(playing)v.play();},{once:true});
+    setCardLang(l);
+  };
   const badge=html`<span class="jbadge">${style}</span>`;
   return html`<div class="jcard">
     ${badge}<div class="jp">${prompt}</div>
     ${s.status==='done'?html`
-      <video src=${api.videoUrl(id)} controls playsinline></video>
-      <a class="mini-dl" href=${api.downloadUrl(id)}>⬇ Download</a>`
+      ${s.has_hi?html`<div style=${{display:'flex',gap:'6px',marginBottom:'8px'}}>
+        <button class=${'tab'+(cardLang==='en'?' on':'')} onClick=${()=>switchCardLang('en')}
+                style=${{padding:'5px 12px',fontSize:'12px',cursor:'pointer'}}>🇬🇧 EN</button>
+        <button class=${'tab'+(cardLang==='hi'?' on':'')} onClick=${()=>switchCardLang('hi')}
+                style=${{padding:'5px 12px',fontSize:'12px',cursor:'pointer'}}>🇮🇳 HI</button>
+      </div>`:null}
+      <video ref=${cardVid} src=${api.videoUrl(id,s.has_hi?cardLang:'')} controls playsinline></video>
+      <a class="mini-dl" href=${api.videoUrl(id,s.has_hi?cardLang:'')}>⬇ Download</a>`
     : (s.status==='error'||s.status==='interrupted')?html`<div class="jstat"><span class="jerr">✗ ${s.error||s.status}</span></div>`
     : html`<div class="jstat"><span>${s.phase||s.status}</span><span class="pct">${s.percent||0}%</span></div>
            <div class="bar"><div style=${{width:(s.percent||0)+'%'}}></div></div>`}
