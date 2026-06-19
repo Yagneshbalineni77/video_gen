@@ -1,9 +1,9 @@
 """
 Phase 3 – Asset Factory (Google-only stack)
-1. Gemini TTS  → per-scene narration .wav files
+1. Dextora TTS  → per-scene narration .wav files
 2. mutagen     → exact duration measurement → written back into script JSON
 3. Prompt Enrichment → Gemini enhances each video_prompt for Veo
-4. Veo 3.0     → per-scene video clips (via AI Studio API key)
+4. Dextora     → per-scene video clips (via AI Studio API key)
 
 v2: Adds prompt enrichment step — uses Gemini to transform Phase 2's video
     prompts into hyper-detailed Veo-optimized cinematic descriptions before
@@ -16,6 +16,7 @@ import math
 import time
 import wave
 import shutil
+import threading
 from pathlib import Path
 
 from google import genai
@@ -43,7 +44,7 @@ class ImagenBlockedError(RuntimeError):
     """Imagen returned no images — a safety filter block. Deterministic for a
     given prompt, so this is NOT retried (avoids a multi-hour retry hang)."""
 
-# Deep dramatic voices available in Gemini TTS
+# Deep dramatic voices available in Dextora TTS
 # Charon = deep dramatic male, Fenrir = intense male, Kore = calm female
 _TTS_VOICE = settings.GEMINI_TTS_VOICE
 
@@ -69,7 +70,7 @@ def _build_enrichment_system(style: dict) -> str:
             "- Keep the illustrated/rendered look identical in every described element"
         )
 
-    return f"""You are a veteran art director writing prompts for Veo 3.0, Google's
+    return f"""You are a veteran art director writing prompts for Dextora, Google's
 state-of-the-art AI video generator. Transform draft descriptions into hyper-detailed,
 production-ready prompts whose every frame matches ONE consistent visual medium.
 
@@ -87,18 +88,41 @@ RULES:
 - Every element must be SPECIFIC to the narration context — not generic atmosphere.
 - Mandate smooth, dynamic camera movement so the shot is never static.
 - SAFETY: avoid graphic/violent/terrifying wording (no "raw terror", "screaming",
-  "panic"); express emotion safely (tears, subtle smiles, longing)."""
+  "panic"); express emotion safely (tears, subtle smiles, longing).
+- NEVER depict a periodic table of elements — AI image generators cannot render
+  accurate chemical symbols (they hallucinate fake ones). Instead show: 3D molecular
+  models, glowing atomic orbitals, chemistry lab glassware, molecular lattice
+  structures, or coloured electron-cloud diagrams. Replace any "periodic table"
+  reference with one of these visually accurate alternatives."""
 
 
 class AssetFactory:
     def __init__(self) -> None:
-        self._client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        # Key pool: one client per API key. Calls round-robin across them to spread
+        # load past per-key rate limits (see settings.GEMINI_API_KEYS).
+        self._clients = [genai.Client(api_key=k) for k in settings.GEMINI_API_KEYS]
+        self._client = self._clients[0]          # primary (default / non-rotated)
+        self._key_i = 0
+        self._key_lock = threading.Lock()
+        if len(self._clients) > 1:
+            log.info("  [keys] API key pool active: %d keys (round-robin)", len(self._clients))
         self._audio_dir = settings.OUTPUT_DIR / "audio"
         self._video_dir = settings.OUTPUT_DIR / "video"
         self._char_dir = settings.OUTPUT_DIR / "characters"
         self._audio_dir.mkdir(parents=True, exist_ok=True)
         self._video_dir.mkdir(parents=True, exist_ok=True)
         self._char_dir.mkdir(parents=True, exist_ok=True)
+
+    def _next_client(self):
+        """Thread-safe round-robin over the key pool. One-shot calls (TTS, Imagen,
+        enrichment) rotate per call; a Veo clip grabs one client for its whole
+        generate→poll→download lifecycle (the operation handle is key-bound)."""
+        if len(self._clients) == 1:
+            return self._clients[0]
+        with self._key_lock:
+            c = self._clients[self._key_i % len(self._clients)]
+            self._key_i += 1
+        return c
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -131,7 +155,7 @@ class AssetFactory:
         out.write_text(script.model_dump_json(indent=2), encoding="utf-8")
         log.info("Script (with durations) saved -> %s", out)
 
-    # ── audio via Gemini TTS ─────────────────────────────────────────────────
+    # ── audio via Dextora TTS ─────────────────────────────────────────────────
 
     @staticmethod
     def _tts_style() -> tuple[str, str]:
@@ -151,26 +175,45 @@ class AssetFactory:
             if wav_path.exists():
                 log.info("  [audio] scene %d cached", scene.scene_id)
             else:
-                self._tts(scene.narration, wav_path, voice, tone)
-                log.info("  [audio] scene %d -> %s", scene.scene_id, wav_path.name)
+                try:
+                    self._tts(scene.narration, wav_path, voice, tone)
+                    log.info("  [audio] scene %d -> %s", scene.scene_id, wav_path.name)
+                except Exception as exc:  # blocked/empty TTS — never kill the whole video
+                    log.warning("  [audio] scene %d TTS failed (%s); retrying as plain read",
+                                scene.scene_id, exc)
+                    try:
+                        self._tts(scene.narration, wav_path, voice, plain=True)
+                        log.info("  [audio] scene %d -> %s (plain)", scene.scene_id, wav_path.name)
+                    except Exception as exc2:
+                        secs = max(2.0, len(scene.narration.split()) / 2.6)
+                        log.warning("  [audio] scene %d TTS unrecoverable (%s); writing %.1fs "
+                                    "silence so the video still completes (subtitle still shows)",
+                                    scene.scene_id, exc2, secs)
+                        self._write_silence(wav_path, secs)
 
             duration_ms = self._wav_duration_ms(wav_path)
             assets.append(AudioAsset(scene_id=scene.scene_id, path=wav_path, duration_ms=duration_ms))
         return assets
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=20))
-    def _tts(self, text: str, dest: Path, voice: str | None = None, tone: str | None = None) -> None:
+    def _tts(self, text: str, dest: Path, voice: str | None = None,
+             tone: str | None = None, plain: bool = False) -> None:
         voice = voice or settings.GEMINI_TTS_VOICE
-        # Style prompt: Gemini TTS interprets a leading directive as DELIVERY guidance
-        # (it speaks only the text after it). This turns flat read-aloud into a
-        # directed performance — the biggest single TTS quality lever, and free.
-        # The active narration profile adds the accent/language (e.g. Indian English).
-        directive = tone or settings.TTS_DEFAULT["tone"]
-        profile = settings.narration_profile()
-        if profile.get("tts_directive"):
-            directive = f"{directive}, {profile['tts_directive']}"
-        contents = f"{directive}:\n\n{text}"
-        response = self._client.models.generate_content(
+        if plain:
+            # Fallback path: speak the raw text with no delivery directive — fewer
+            # tokens for a safety filter to trip on if the directive was the problem.
+            contents = text
+        else:
+            # Style prompt: Dextora TTS interprets a leading directive as DELIVERY guidance
+            # (it speaks only the text after it). This turns flat read-aloud into a
+            # directed performance — the biggest single TTS quality lever, and free.
+            # The active narration profile adds the accent/language (e.g. Indian English).
+            directive = tone or settings.TTS_DEFAULT["tone"]
+            profile = settings.narration_profile()
+            if profile.get("tts_directive"):
+                directive = f"{directive}, {profile['tts_directive']}"
+            contents = f"{directive}:\n\n{text}"
+        response = self._next_client().models.generate_content(
             model=settings.GEMINI_TTS_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
@@ -182,12 +225,47 @@ class AssetFactory:
                 ),
             ),
         )
-        audio_data = response.candidates[0].content.parts[0].inline_data.data
+        audio_data = self._extract_audio(response)
         with wave.open(str(dest), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(24000)
             wf.writeframes(audio_data)
+
+    @staticmethod
+    def _extract_audio(response) -> bytes:
+        """Pull PCM bytes out of a TTS response, defensively.
+
+        A blocked/empty candidate has ``content is None`` (the old code did
+        ``response.candidates[0].content.parts[0]`` and threw AttributeError,
+        killing the whole job). Here we surface *why* and raise a retryable
+        error instead, so transient empties retry and the caller can fall back."""
+        candidates = getattr(response, "candidates", None) or []
+        for cand in candidates:
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None) if content else None
+            for part in (parts or []):
+                inline = getattr(part, "inline_data", None)
+                data = getattr(inline, "data", None) if inline else None
+                if data:
+                    return data
+        finish = getattr(candidates[0], "finish_reason", None) if candidates else None
+        feedback = getattr(response, "prompt_feedback", None)
+        raise RuntimeError(
+            f"TTS returned no audio (finish_reason={finish}, prompt_feedback={feedback})"
+        )
+
+    @staticmethod
+    def _write_silence(dest: Path, seconds: float) -> None:
+        """Write a mono 24 kHz 16-bit silent WAV so a failed scene still has a
+        valid, correctly-timed audio track and the render completes."""
+        rate = 24000
+        frames = int(rate * max(0.5, seconds))
+        with wave.open(str(dest), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(b"\x00\x00" * frames)
 
     @staticmethod
     def _wav_duration_ms(path: Path) -> int:
@@ -228,7 +306,7 @@ class AssetFactory:
             )
 
             try:
-                response = self._client.models.generate_images(
+                response = self._next_client().models.generate_images(
                     model=settings.GEMINI_IMAGE_MODEL,
                     prompt=prompt,
                     config=types.GenerateImagesConfig(
@@ -324,7 +402,7 @@ class AssetFactory:
             f'"{scene.narration}"\n\n'
             f"DRAFT PROMPT to enhance:\n"
             f'"{scene.video_prompt}"\n\n'
-            f"Rewrite as a 60-100 word Veo 3.0 prompt. Requirements:\n"
+            f"Rewrite as a 60-100 word Dextora prompt. Requirements:\n"
             f"- OPEN by naming the render medium above, so the style stays consistent\n"
             f"- ZERO vague mood words — describe ONLY what the camera sees\n"
             f"- Start the action with an explicit camera move; end with an ambient audio cue\n"
@@ -334,7 +412,7 @@ class AssetFactory:
             f"Output ONLY the rewritten prompt, nothing else."
         )
 
-        response = self._client.models.generate_content(
+        response = self._next_client().models.generate_content(
             model=settings.GEMINI_SCRIPT_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -382,7 +460,7 @@ class AssetFactory:
 
         return t
 
-    # ── visuals via Imagen 4 & Veo 3.0 ───────────────────────────────────────
+    # ── visuals via Dextora & Dextora ───────────────────────────────────────
 
     def _generate_visuals(self, script: VideoScript) -> list[VisualAsset]:
         """Concurrent two-pass generation:
@@ -417,14 +495,14 @@ class AssetFactory:
                 # Phase 2 video_prompt instead of crashing the whole job.
                 log.warning("  [enrich] scene %d failed (%s) — using Phase 2 prompt", scene.scene_id, exc)
                 enriched = scene.video_prompt
-            if scene.veo_mode == "direct":
+            if scene.veo_mode == "direct" and not settings.SKIP_VEO:
                 return scene.scene_id, enriched, None   # text-to-video → no keyframe needed
             try:
                 kf = self._gen_keyframe_image(scene, enriched, anchor)
             except Exception as exc:
                 # Imagen blocked/failed — render a fallback slide so the scene is still
                 # covered and the video completes (never crash the whole run on one scene).
-                log.warning("  [visual/imagen4] scene %d keyframe failed (%s) — fallback slide", scene.scene_id, exc)
+                log.warning("  [visual/dextora] scene %d keyframe failed (%s) — fallback slide", scene.scene_id, exc)
                 kf = self._make_fallback_slide(scene)
             return scene.scene_id, enriched, kf
 
@@ -433,6 +511,28 @@ class AssetFactory:
             for sid, enriched, kf in ex.map(_prep, veo_scenes):
                 enriched_map[sid] = enriched
                 keyframe_map[sid] = kf
+
+        # ── FAST MODE: skip Veo, every scene is its keyframe + Ken Burns ─────
+        if settings.SKIP_VEO:
+            log.info("  [visual] FAST MODE (SKIP_VEO) – %d scenes use keyframe + Ken Burns, no Dextora render", len(veo_scenes))
+            veo_assets: dict[int, VisualAsset] = {}
+            for scene in veo_scenes:
+                sid = scene.scene_id
+                kf = keyframe_map.get(sid) or self._make_fallback_slide(scene)
+                # nonexistent path → Phase 4 Ken-Burns animates the keyframe
+                veo_path = self._video_dir / f"scene_{sid}_veo.mp4"
+                veo_assets[sid] = VisualAsset(scene_id=sid, raw_video_path=veo_path, keyframe_image_path=kf)
+            anim_assets = {}
+            anim_scenes = [s for s in script.scenes if s.engine_type == "code_animator"]
+            for scene in anim_scenes:
+                kf = self._make_fallback_slide(scene)
+                veo_path = self._video_dir / f"scene_{scene.scene_id}_veo.mp4"
+                anim_assets[scene.scene_id] = VisualAsset(
+                    scene_id=scene.scene_id, raw_video_path=veo_path, keyframe_image_path=kf)
+            assets: list[VisualAsset] = []
+            for scene in script.scenes:
+                assets.append(veo_assets.get(scene.scene_id) or anim_assets[scene.scene_id])
+            return assets
 
         # ── Pass 2: Veo clips (parallel, with graceful fallback) ─────────────
         def _veo(scene: SceneScript) -> VisualAsset:
@@ -444,7 +544,7 @@ class AssetFactory:
                 veo_path = self._gen_veo(scene, enriched_map[sid], kf, next_kf)
             except Exception as exc:
                 log.warning(
-                    "  [visual/veo3] scene %d (%s) failed (%s) — falling back to keyframe card",
+                    "  [visual/dextora] scene %d (%s) failed (%s) — falling back to keyframe card",
                     sid, scene.veo_mode, exc,
                 )
                 # Direct scenes have no keyframe to Ken-Burns; make a text card so the
@@ -454,7 +554,7 @@ class AssetFactory:
                 veo_path = self._video_dir / f"scene_{sid}_veo.mp4"  # nonexistent → Phase 4 fallback
             return VisualAsset(scene_id=sid, raw_video_path=veo_path, keyframe_image_path=kf)
 
-        log.info("  [visual] Pass 2 – Veo render for %d scenes (%d workers)", len(veo_scenes), workers)
+        log.info("  [visual] Pass 2 – Dextora render for %d scenes (%d workers)", len(veo_scenes), workers)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             veo_assets = {a.scene_id: a for a in ex.map(_veo, veo_scenes)}
 
@@ -524,7 +624,7 @@ class AssetFactory:
     def _gen_keyframe_image(self, scene: SceneScript, enriched_prompt: str, character_anchor: str = "") -> Path:
         dest = self._video_dir / f"scene_{scene.scene_id}_keyframe.png"
         if dest.exists():
-            log.info("  [visual/imagen4] scene %d keyframe cached", scene.scene_id)
+            log.info("  [visual/dextora] scene %d keyframe cached", scene.scene_id)
             return dest
 
         # Lead with the render medium so Imagen locks the style for this keyframe;
@@ -538,8 +638,8 @@ class AssetFactory:
         )
         full_prompt = f"{medium_line}{body}"
 
-        log.info("  [visual/imagen4] scene %d generating keyframe…", scene.scene_id)
-        response = self._client.models.generate_images(
+        log.info("  [visual/dextora] scene %d generating keyframe…", scene.scene_id)
+        response = self._next_client().models.generate_images(
             model=settings.GEMINI_IMAGE_MODEL,
             prompt=full_prompt,
             config=types.GenerateImagesConfig(
@@ -586,43 +686,48 @@ class AssetFactory:
         dest = self._video_dir / f"scene_{scene.scene_id}_keyframe.png"
         W, H = 1920, 1080
         img = Image.new("RGB", (W, H), (10, 14, 28))
-        draw = ImageDraw.Draw(img)
-        for y in range(H):  # subtle vertical gradient
-            shade = int(10 + 22 * (y / H))
-            draw.line([(0, y), (W, y)], fill=(shade, shade + 4, shade + 14))
-        draw.rectangle([60, 60, W - 60, H - 60], outline=(70, 90, 140), width=3)
+        try:
+            draw = ImageDraw.Draw(img)
+            for y in range(H):  # subtle vertical gradient
+                shade = int(10 + 22 * (y / H))
+                draw.line([(0, y), (W, y)], fill=(shade, shade + 4, shade + 14))
+            draw.rectangle([60, 60, W - 60, H - 60], outline=(70, 90, 140), width=3)
 
-        text = (scene.narration or "").strip()
-        is_deva = any("ऀ" <= ch <= "ॿ" for ch in text)
-        font = self._load_font(64, devanagari=is_deva)
+            text = (scene.narration or "").strip()
+            is_deva = any("ऀ" <= ch <= "ॿ" for ch in text)
+            font = self._load_font(64, devanagari=is_deva)
 
-        # word-wrap to fit within the inner margin
-        max_w = W - 360
-        words, lines, cur = text.split(), [], ""
-        for w in words:
-            trial = f"{cur} {w}".strip()
-            if draw.textlength(trial, font=font) <= max_w:
-                cur = trial
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = w
-        if cur:
-            lines.append(cur)
-        lines = lines[:6] or [" "]
+            # word-wrap to fit within the inner margin
+            max_w = W - 360
+            words, lines, cur = text.split(), [], ""
+            for w in words:
+                trial = f"{cur} {w}".strip()
+                if draw.textlength(trial, font=font) <= max_w:
+                    cur = trial
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+            if cur:
+                lines.append(cur)
+            lines = lines[:6] or [" "]
 
-        line_h = int(font.size * 1.4)
-        total_h = line_h * len(lines)
-        y = (H - total_h) // 2
-        for ln in lines:
-            w = draw.textlength(ln, font=font)
-            x = (W - w) // 2
-            draw.text((x + 2, y + 2), ln, font=font, fill=(0, 0, 0))      # shadow
-            draw.text((x, y), ln, font=font, fill=(235, 233, 245))         # text
-            y += line_h
+            line_h = int(font.size * 1.4)
+            total_h = line_h * len(lines)
+            y = (H - total_h) // 2
+            for ln in lines:
+                w = draw.textlength(ln, font=font)
+                x = (W - w) // 2
+                draw.text((x + 2, y + 2), ln, font=font, fill=(0, 0, 0))      # shadow
+                draw.text((x, y), ln, font=font, fill=(235, 233, 245))         # text
+                y += line_h
+        except Exception as exc:
+            # never let the last-resort slide raise — fall back to a plain solid card
+            log.warning("  [visual] fallback slide render degraded (%s) — plain card", exc)
+            img = Image.new("RGB", (W, H), (10, 14, 28))
 
         img.save(str(dest))
-        log.info("  [visual/imagen4] scene %d -> text-card fallback", scene.scene_id)
+        log.info("  [visual/dextora] scene %d -> text-card fallback", scene.scene_id)
         return dest
 
     def _gen_veo(
@@ -635,14 +740,14 @@ class AssetFactory:
         # keyframe_path is None for veo_mode="direct" scenes → Veo text-to-video.
         dest = self._video_dir / f"scene_{scene.scene_id}_veo.mp4"
         if dest.exists():
-            log.info("  [visual/veo3] scene %d cached", scene.scene_id)
+            log.info("  [visual/dextora] scene %d cached", scene.scene_id)
             return dest
 
         audio_secs = (scene.duration_ms or 8000) / 1000.0
         n_clips = max(1, math.ceil(audio_secs / 8))
 
         log.info(
-            "  [visual/veo3] scene %d – %d clip(s) for %.1fs, prompt: %s…",
+            "  [visual/dextora] scene %d – %d clip(s) for %.1fs, prompt: %s…",
             scene.scene_id, n_clips, audio_secs, enriched_prompt[:120],
         )
 
@@ -663,7 +768,7 @@ class AssetFactory:
             for c in clips:
                 c.unlink(missing_ok=True)
 
-        log.info("  [visual/veo3] scene %d -> %s", scene.scene_id, dest.name)
+        log.info("  [visual/dextora] scene %d -> %s", scene.scene_id, dest.name)
         return dest
 
     @retry(
@@ -682,6 +787,10 @@ class AssetFactory:
         dest = self._video_dir / f"scene_{scene.scene_id}_clip{clip_idx}.mp4"
         if dest.exists():
             return dest
+
+        # One key for this clip's whole lifecycle (generate → poll → download):
+        # the operation handle is bound to the key/project that created it.
+        client = self._next_client()
 
         # keyframe_path None → text-to-video (direct mode); else image-to-video.
         start_image = (
@@ -745,17 +854,17 @@ class AssetFactory:
         gen_kwargs = {"model": settings.VEO_MODEL, "prompt": veo_prompt, "config": veo_config}
         if start_image is not None:
             gen_kwargs["image"] = start_image   # omit entirely for text-to-video
-        operation = self._client.models.generate_videos(**gen_kwargs)
+        operation = client.models.generate_videos(**gen_kwargs)
 
         # Poll up to ~10 min, logging progress at INFO so a slow job is visible.
         max_polls = 120
         for attempt in range(max_polls):
-            operation = self._client.operations.get(operation)
+            operation = client.operations.get(operation)
             if operation.done:
                 break
             if attempt and attempt % 6 == 0:  # every ~30s
                 log.info(
-                    "  [veo3] scene %d clip %d still rendering (%.0fs elapsed)",
+                    "  [dextora] scene %d clip %d still rendering (%.0fs elapsed)",
                     scene.scene_id, clip_idx, time.time() - t_submit,
                 )
             time.sleep(5)
@@ -776,10 +885,10 @@ class AssetFactory:
                 f"(safety filter). filtered_count={count} reasons={reasons}"
             )
 
-        video_bytes = self._client.files.download(file=operation.response.generated_videos[0])
+        video_bytes = client.files.download(file=operation.response.generated_videos[0])
         dest.write_bytes(video_bytes)
         log.info(
-            "  [veo3] scene %d clip %d done in %.0fs (%d bytes)",
+            "  [dextora] scene %d clip %d done in %.0fs (%d bytes)",
             scene.scene_id, clip_idx, time.time() - t_submit, len(video_bytes),
         )
         return dest
