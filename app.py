@@ -1,5 +1,5 @@
 """
-Faceless AI Studio — demo frontend
+Dextora Creator — demo frontend
 Run: streamlit run app.py
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ OUTPUT = ROOT / "output"
 # ── page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Faceless AI Studio",
+    page_title="Dextora Creator",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -297,7 +297,7 @@ def _render_script(script: dict):
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 🎬 Faceless AI Studio")
+    st.markdown("## 🎬 Dextora Creator")
     st.markdown("---")
 
     st.markdown("### Settings")
@@ -325,7 +325,7 @@ with st.sidebar:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-st.markdown("# 🎬 Faceless AI Studio")
+st.markdown("# 🎬 Dextora Creator")
 st.markdown(
     '<p style="color:#555577;margin-top:-12px;margin-bottom:24px">'
     "Automated dark-history YouTube channel · Powered by Gemini + Veo 3.0</p>",

@@ -4,7 +4,7 @@ This is the running context for the project so any new machine / fresh session c
 continue without re-discovering everything. (Pairs with `git log` and `HOSTING.md`.)
 
 ## What this is
-Faceless educational video generator: **prompt + style + language → narrated,
+Dextora educational video generator: **prompt + style + language → narrated,
 subtitled MP4**. Pipeline = Phase 2 (Gemini script) → Phase 3 (Gemini TTS +
 Imagen keyframe + Veo clip) → Phase 4 (ffmpeg assemble + subtitles). Web product
 in `server.py` (FastAPI) + `frontend/` (React). Parallel batches via `produce.py`.

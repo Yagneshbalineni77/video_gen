@@ -1,0 +1,199 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>Dextora Creator — Portal API</title>
+<style>
+ body{font:14px/1.6 -apple-system,Segoe UI,Arial,sans-serif;max-width:860px;margin:32px auto;padding:0 24px;color:#1a1a2e}
+ h1{border-bottom:3px solid #4fc3f7;padding-bottom:8px}
+ h2{margin-top:28px;color:#0d47a1;border-bottom:1px solid #ddd;padding-bottom:4px}
+ code{background:#f0f3f8;padding:2px 5px;border-radius:4px;font-size:13px}
+ pre{background:#0b0f1a;color:#cfe;padding:14px;border-radius:8px;overflow:auto;font-size:12.5px}
+ pre code{background:none;color:inherit}
+ table{border-collapse:collapse;width:100%;margin:10px 0}
+ th,td{border:1px solid #ccd;padding:7px 10px;text-align:left;font-size:13px}
+ th{background:#eef4fb}
+ blockquote{border-left:4px solid #4fc3f7;margin:0;padding:6px 14px;background:#f6fafe}
+ @media print{body{margin:0}}
+</style></head><body><h1>Dextora Creator — Portal Integration API (v1)</h1>
+<p>API reference for the <strong>education portal ↔ video pipeline</strong> integration.</p>
+<p>The portal authors the scripts (existing curriculum API). <strong>Dextora Creator</strong> generates
+the videos and exposes them here, <strong>keyed by the portal's own script <code>id</code></strong> — so the
+portal fetches results with the same <code>id</code>s it already has. No mapping, no webhook: the
+portal <strong>polls</strong>.</p>
+<hr />
+<h2>Base URL</h2>
+<pre><code>https://videogen.dextora.org
+</code></pre>
+<h2>Authentication</h2>
+<p>Optional. If the server sets the env var <code>PORTAL_API_KEY</code>, every request must include:</p>
+<pre><code>X-API-Key: &lt;key&gt;
+</code></pre>
+<p>If <code>PORTAL_API_KEY</code> is unset, the endpoints are open (fine for an internal/in-house host).</p>
+<h2>Content type</h2>
+<p>All responses are <code>application/json</code> (except the video file stream, which is <code>video/mp4</code>).</p>
+<hr />
+<h2>1. Generate a video (push)  ⭐ start here</h2>
+<p>The portal sends a full script; we render the video and store it keyed by <strong>your own <code>id</code></strong>.</p>
+<pre><code>POST /api/v1/generate
+</code></pre>
+<p><strong>Body</strong>
+| Field | Type | Notes |
+|---|---|---|
+| <code>id</code> | int | <strong>required</strong> — your script id; all results are keyed by it |
+| <code>audio_script</code> | string | <strong>required</strong> — the narration text |
+| <code>title</code> | string | optional |
+| <code>visual_directions</code> | string | optional — timestamped cues (<code>0:00-0:05 → …</code>) become scene prompts |
+| <code>language</code> | string | <code>English</code> (default) or <code>Hindi</code> |
+| <code>subject</code> | string | sets visual style (e.g. <code>Chemistry</code>, <code>History</code>) |
+| <code>duration_seconds</code> | int | optional target length |
+| <code>class_id</code> / <code>subject_id</code> / <code>chapter_id</code> | int | optional — stored for fetch-by-chapter |
+| <code>script_type</code> | string | <code>VIDEO</code> (default) or <code>REEL</code> |</p>
+<p><strong>curl</strong></p>
+<pre><code class="language-bash">curl -X POST &quot;https://videogen.dextora.org/api/v1/generate&quot; \
+  -H &quot;X-API-Key: &lt;key&gt;&quot; -H &quot;Content-Type: application/json&quot; \
+  -d '{&quot;id&quot;:12345,&quot;title&quot;:&quot;Mole Concept&quot;,&quot;audio_script&quot;:&quot;Today we explore the mole...&quot;,&quot;visual_directions&quot;:&quot;0:00-0:10 → 3D molecules&quot;,&quot;language&quot;:&quot;English&quot;,&quot;subject&quot;:&quot;Chemistry&quot;,&quot;duration_seconds&quot;:240,&quot;class_id&quot;:11,&quot;subject_id&quot;:49,&quot;chapter_id&quot;:509}'
+</code></pre>
+<p><strong>Response</strong> <code>{ "id": 12345, "status": "queued" }</code></p>
+<p>→ then <strong>poll #2</strong> (<code>GET /api/v1/videos?ids=12345</code>) for status + video/audio/thumbnail URLs.</p>
+<p><strong>Codes:</strong> <code>200</code> queued · <code>400</code> missing <code>audio_script</code> · <code>401</code> bad key</p>
+<hr />
+<h2>2. List / fetch videos  ⭐ poll for results</h2>
+<p>Returns generation status + the playable URLs for one or more scripts.</p>
+<pre><code>GET /api/v1/videos
+</code></pre>
+<p><strong>Query (use either form):</strong>
+| Param | Type | Example | Notes |
+|---|---|---|---|
+| <code>ids</code> | string (csv) | <code>881,882,883</code> | fetch specific script ids |
+| <code>class_id</code> | int | <code>11</code> | filter by class |
+| <code>subject_id</code> | int | <code>49</code> | filter by subject |
+| <code>chapter_id</code> | int | <code>509</code> | filter by chapter |</p>
+<p>You can combine <code>class_id</code>+<code>subject_id</code>+<code>chapter_id</code>, <strong>or</strong> pass <code>ids</code>.</p>
+<p><strong>curl</strong></p>
+<pre><code class="language-bash">curl &quot;https://videogen.dextora.org/api/v1/videos?ids=881,882&quot; -H &quot;X-API-Key: &lt;key&gt;&quot;
+curl &quot;https://videogen.dextora.org/api/v1/videos?class_id=11&amp;subject_id=49&amp;chapter_id=509&quot; -H &quot;X-API-Key: &lt;key&gt;&quot;
+</code></pre>
+<p><strong>200 Response</strong></p>
+<pre><code class="language-json">{
+  &quot;count&quot;: 1,
+  &quot;videos&quot;: [
+    {
+      &quot;id&quot;: 881,
+      &quot;atom_id&quot;: 2247,
+      &quot;chapter_id&quot;: 509,
+      &quot;subject_id&quot;: 49,
+      &quot;language&quot;: &quot;English&quot;,
+      &quot;title&quot;: &quot;Ancient Indian Atomic Theory: Paramãnu &amp; Acharya Kanda&quot;,
+      &quot;status&quot;: &quot;done&quot;,
+      &quot;duration&quot;: 240,
+      &quot;video_url&quot;: &quot;https://videogen.dextora.org/api/v1/videos/881/file&quot;,
+      &quot;audio_url&quot;: &quot;https://videogen.dextora.org/api/v1/videos/881/audio&quot;,
+      &quot;thumbnail_url&quot;: &quot;https://videogen.dextora.org/api/v1/videos/881/thumbnail&quot;
+    }
+  ]
+}
+</code></pre>
+<ul>
+<li><code>audio_url</code> = narration-only MP3 (for a "Listen" feature).</li>
+<li><code>thumbnail_url</code> = JPG poster image for the video.</li>
+<li>All three URLs are set when <code>status=done</code>.</li>
+</ul>
+<p><strong><code>status</code> values:</strong> <code>queued</code> → <code>generating</code> → <code>done</code> → (<code>error</code>)
+- <code>video_url</code> is <strong>non-null only when <code>status == "done"</code></strong>.
+- Scripts not yet submitted for generation simply won't appear in <code>videos</code>.</p>
+<p><strong>Codes:</strong> <code>200</code> OK · <code>401</code> invalid/missing <code>X-API-Key</code></p>
+<hr />
+<h2>2. Stream / download a video file</h2>
+<p>The actual MP4 — this is exactly what <code>video_url</code> points to.</p>
+<pre><code>GET /api/v1/videos/{script_id}/file
+</code></pre>
+<p><strong>curl</strong></p>
+<pre><code class="language-bash">curl -L &quot;https://videogen.dextora.org/api/v1/videos/881/file&quot; -H &quot;X-API-Key: &lt;key&gt;&quot; -o 881.mp4
+</code></pre>
+<p>Returns the video (<code>Content-Type: video/mp4</code>). Embed <code>video_url</code> directly in an HTML
+<code>&lt;video&gt;</code> tag or your player.</p>
+<p><strong>Codes:</strong> <code>200</code> OK · <code>401</code> bad key · <code>404</code> video not ready / file missing</p>
+<hr />
+<h2>2a. Narration audio (MP3)</h2>
+<p>The narration track on its own — for the portal's "Listen" feature. Extracted from
+the final video on first request, then cached.</p>
+<pre><code>GET /api/v1/videos/{script_id}/audio
+</code></pre>
+<p><strong>curl</strong></p>
+<pre><code class="language-bash">curl -L &quot;https://videogen.dextora.org/api/v1/videos/881/audio&quot; -H &quot;X-API-Key: &lt;key&gt;&quot; -o 881.mp3
+</code></pre>
+<p>Returns <code>audio/mpeg</code>. This is what <code>audio_url</code> points to.</p>
+<p><strong>Codes:</strong> <code>200</code> OK · <code>401</code> bad key · <code>404</code> not ready</p>
+<hr />
+<h2>2c. Thumbnail (JPG)</h2>
+<p>A poster image for the video — the clean scene-1 keyframe (or a frame from the video).
+Generated on first request, then cached.</p>
+<pre><code>GET /api/v1/videos/{script_id}/thumbnail
+</code></pre>
+<p><strong>curl</strong></p>
+<pre><code class="language-bash">curl -L &quot;https://videogen.dextora.org/api/v1/videos/881/thumbnail&quot; -H &quot;X-API-Key: &lt;key&gt;&quot; -o 881.jpg
+</code></pre>
+<p>Returns <code>image/jpeg</code> (1280px wide). This is what <code>thumbnail_url</code> points to.</p>
+<p><strong>Codes:</strong> <code>200</code> OK · <code>401</code> bad key · <code>404</code> not ready</p>
+<hr />
+<h2>2b. Per-run backend log + progress</h2>
+<p>Watch a single render's live progress and pipeline log — no host shell needed.</p>
+<pre><code>GET /api/v1/videos/{script_id}/log?lines=80
+</code></pre>
+<p><strong>curl</strong></p>
+<pre><code class="language-bash">curl &quot;https://videogen.dextora.org/api/v1/videos/1531/log?lines=60&quot; -H &quot;X-API-Key: &lt;key&gt;&quot;
+</code></pre>
+<p><strong>200 Response</strong></p>
+<pre><code class="language-json">{
+  &quot;script_id&quot;: 1531,
+  &quot;phase&quot;: &quot;Generating visuals&quot;,
+  &quot;percent&quot;: 45,
+  &quot;scenes_done&quot;: 5,
+  &quot;scenes_total&quot;: 11,
+  &quot;log_tail&quot;: &quot;...last N lines of the pipeline log...&quot;
+}
+</code></pre>
+<ul>
+<li><code>phase</code> ∈ Writing script → Generating visuals → Assembling clips → Finalizing.</li>
+<li><code>lines</code> (optional, default 80, max 1000) = how many log lines to return.</li>
+</ul>
+<p><strong>Codes:</strong> <code>200</code> OK · <code>401</code> bad key · <code>404</code> no log for this script yet</p>
+<hr />
+<h2>3. Trigger generation for a chapter  (optional · admin)</h2>
+<p>Kick off video generation for a whole chapter. Runs in the background; poll <strong>#1</strong> for
+results. <em>(Optional — Dextora can also start generation on its side.)</em></p>
+<pre><code>POST /api/v1/bridge/run
+Authorization: Bearer &lt;admin-token&gt;
+Content-Type: application/json
+</code></pre>
+<p><strong>Body</strong>
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| <code>class_id</code> | int | — | required |
+| <code>subject_id</code> | int | — | required |
+| <code>chapter_id</code> | int | — | required |
+| <code>subject</code> | string | <code>""</code> | selects visual style (e.g. <code>"Chemistry"</code>) |
+| <code>languages</code> | string[] | <code>["English"]</code> | <code>["English","Hindi"]</code> |
+| <code>types</code> | string[] | <code>["VIDEO"]</code> | <code>["VIDEO","REEL"]</code> |
+| <code>limit</code> | int|null | <code>null</code> | cap how many to generate |
+| <code>workers</code> | int | <code>2</code> | videos generated in parallel |</p>
+<p><strong>curl</strong></p>
+<pre><code class="language-bash">curl -X POST &quot;https://videogen.dextora.org/api/v1/bridge/run&quot; \
+  -H &quot;Authorization: Bearer &lt;admin-token&gt;&quot; -H &quot;Content-Type: application/json&quot; \
+  -d '{&quot;class_id&quot;:11,&quot;subject_id&quot;:49,&quot;chapter_id&quot;:509,&quot;subject&quot;:&quot;Chemistry&quot;,&quot;languages&quot;:[&quot;English&quot;],&quot;types&quot;:[&quot;VIDEO&quot;],&quot;limit&quot;:5}'
+</code></pre>
+<p><strong>202/200 Response</strong> <code>{ "started": true, "class_id": 11, ... }</code></p>
+<p><strong>Codes:</strong> <code>200</code> started · <code>401</code> not logged in · <code>403</code> not an admin</p>
+<hr />
+<h2>Typical integration flow</h2>
+<ol>
+<li>Generation is triggered (by us, or via <strong>#3</strong>).</li>
+<li>Portal <strong>polls #1</strong> (<code>GET /api/v1/videos?...</code>) and watches <code>status</code>.</li>
+<li>When <code>status == "done"</code>, take <code>video_url</code> and embed/play it (served by <strong>#2</strong>).</li>
+</ol>
+<h2>Notes</h2>
+<ul>
+<li><strong>Keyed by your <code>id</code></strong> — fetch with the same script ids you already store.</li>
+<li><strong>No webhook</strong> — poll #1; it's cheap.</li>
+<li><strong>CDN later:</strong> <code>video_url</code> streams from our host today; we can repoint it to a
+  bucket/CDN with <strong>no change to these endpoints</strong> (same response shape).</li>
+<li><strong>Languages:</strong> <code>English → indian_english</code>, <code>Hindi → hindi</code> voices applied automatically.</li>
+</ul></body></html>

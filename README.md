@@ -1,4 +1,4 @@
-# Faceless YouTube Pipeline
+# Dextora YouTube Pipeline
 
 Fully autonomous end-to-end pipeline that finds trending topics, writes scripts,
 generates media, assembles a video, and publishes to YouTube — daily, on autopilot.
